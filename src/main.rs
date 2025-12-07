@@ -8,6 +8,7 @@
 
 mod cli;
 mod config;
+mod constants;
 mod install;
 mod runner;
 mod task;

@@ -12,7 +12,6 @@ use crate::config::HookConfig;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;

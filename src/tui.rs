@@ -1,10 +1,8 @@
 //! Terminal user interface for `huk`.
 //!
-//! This module implements a minimal interactive dashboard using
-//! [`crossterm`](https://docs.rs/crossterm) and
-//! [`ratatui`](https://docs.rs/ratatui). The dashboard lists configured
-//! hooks and allows the user to execute a hook's tasks by pressing Enter.
-//! Press `q` to exit the dashboard.
+//! This module implements a minimal interactive dashboard using [`crossterm`]
+//! and [`ratatui`], which lists configured hooks and allows the user to
+//! execute a hook's tasks by pressing Enter. Press `q` to exit the dashboard.
 
 use crate::config::HookConfig;
 use crate::runner::RunnerError;
@@ -69,7 +67,7 @@ pub fn handle_dashboard() -> Result<(), RunnerError> {
 }
 
 /// Manage the event loop for the dashboard.
-fn run_dashboard(
+pub fn run_dashboard(
   terminal: &mut Terminal<CrosstermBackend<Stdout>>,
   cfg: &HookConfig,
   state: &mut DashboardState,
@@ -95,10 +93,10 @@ fn run_dashboard(
                 format!("> {}", name),
                 Style::default()
                   .fg(Color::Yellow)
-                  .add_modifier(Modifier::BOLD),
+                  .add_modifier(Modifier::BOLD | Modifier::UNDERLINED).underline_color(Color::);
               )
             } else {
-              Span::raw(format!("  {}", name))
+              Span::raw(format!("  {name}", name))
             };
             ListItem::new(content)
           })
@@ -108,7 +106,7 @@ fn run_dashboard(
         f.render_widget(list, chunks[0]);
         // Description panel
         let (_, spec) = &state.hooks[state.selected];
-        let desc = format!("{:?}", spec);
+        let desc = format!("{spec:?}");
         let paragraph = Paragraph::new(desc)
           .block(
             Block::default()

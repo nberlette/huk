@@ -7,7 +7,7 @@
 //! describing the command, description and dependencies, or an array of either
 //! of those two forms.
 
-use ::core::any::{Any, type_name_of_val};
+use ::core::any::type_name_of_val;
 
 use serde_json::Value;
 use thiserror::Error;
