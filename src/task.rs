@@ -7,17 +7,20 @@
 //! describing the command, description and dependencies, or an array of either
 //! of those two forms.
 
-use ::core::any::type_name_of_val;
+use core::any::type_name_of_val;
 
 use serde_json::Value;
 use thiserror::Error;
+use derive_more::with_trait::{Display, Debug, IsVariant, From};
 
 /// Parsed representation of a task specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Display, Clone, PartialEq, Eq, IsVariant, From)]
 pub enum TaskSpec {
   /// A bare string representing a script or command to execute.
+  #[display("{_0}")]
   Single(String),
   /// A detailed object specification containing a command and/or dependencies.
+  #[display("{command}{info}{deps}", command = if let Some(cmd) = command { format!("{cmd}\n") } else { "".to_string() }, info = if let Some(desc) = description { format!("   // {desc}\n") } else { "".to_string() }, deps = if !dependencies.is_empty() { format!("   depends on: {}", dependencies.join(", ")) } else { "".to_string() })]
   Detailed {
     /// Optional shell command to run. If absent, at least one dependency must
     /// be provided.
@@ -28,13 +31,21 @@ pub enum TaskSpec {
     /// to this task.
     dependencies: Vec<String>,
   },
+
   /// A sequence of tasks. Each element may itself be either a single string or
   /// a detailed object.
+  #[display("{tasks}", tasks = {
+    let mut i = 0;
+    _0.iter().map(|t| {
+      i += 1;
+      format!("{i}: {t}")
+    }).collect::<Vec<_>>().join("\n")
+  })]
   Sequence(Vec<TaskSpec>),
 }
 
 /// Errors that may occur while parsing a task specification from JSON.
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[derive(Error, Debug, Clone, PartialEq, Eq, IsVariant)]
 pub enum TaskSpecParseError {
   /// The JSON value was of a type not supported for tasks.
   #[error("expected string, object or array but found {0}")]
@@ -62,7 +73,7 @@ impl TaskSpec {
         let description = map
           .get("description")
           .and_then(|v| v.as_str().map(|s| s.to_string()));
-        let deps_value = map.get("dependencies");
+        let deps_value = map.get("dependencies").or_else(|| map.get("depends"));
         let mut dependencies = Vec::new();
         if let Some(Value::Array(dep_array)) = deps_value {
           for dep in dep_array {
@@ -72,6 +83,8 @@ impl TaskSpec {
               return Err(TaskSpecParseError::InvalidDependencyType);
             }
           }
+        } else if let Some(Value::String(name)) = deps_value {
+          dependencies.push(name.clone());
         }
         if command.is_none() && dependencies.is_empty() {
           return Err(TaskSpecParseError::MissingCommandAndDeps);
@@ -89,9 +102,9 @@ impl TaskSpec {
         }
         Ok(TaskSpec::Sequence(seq))
       }
-      other => {
-        Err(TaskSpecParseError::InvalidType(type_name_of_val(&other).to_string()))
-      }
+      other => Err(TaskSpecParseError::InvalidType(
+        type_name_of_val(&other).to_string(),
+      )),
     }
   }
 }

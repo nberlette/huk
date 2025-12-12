@@ -6,13 +6,12 @@
 //! mirror those used by the CLI: configuration parsing, task definitions and
 //! execution logic.
 
-pub(crate) mod cli;
-pub(crate) mod tui;
-
+mod cli;
 pub mod config;
 pub mod constants;
 pub mod install;
 pub mod runner;
 pub mod task;
+mod tui;
 
 pub use constants::*;

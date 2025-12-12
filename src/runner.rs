@@ -5,6 +5,7 @@
 //! configuration loading to [`crate::config`] and executes commands via
 //! [`std::process::Command`].
 
+use crate::GIT_HOOKS;
 use crate::cli::AddOpts;
 use crate::cli::ListOpts;
 use crate::cli::RemoveOpts;
@@ -12,8 +13,10 @@ use crate::cli::RunOpts;
 use crate::cli::TasksOpts;
 use crate::cli::UpdateOpts;
 use crate::config::ConfigError;
+use crate::config::ConfigSource;
 use crate::config::HookConfig;
 use crate::task::TaskSpec;
+use ::ratatui::prelude::Stylize;
 use std::collections::HashSet;
 use std::io;
 use std::process::Command;
@@ -43,17 +46,20 @@ pub enum RunnerError {
 /// Handler for the `list` subcommand.
 pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
   let cfg = HookConfig::discover(&std::env::current_dir()?)?;
-  if cfg.hooks.is_empty() {
-    println!("No hooks defined in configuration.");
+  let n = cfg.hooks.len();
+  let path = cfg.source.as_path_buf().display().to_string();
+  if n == 0 {
+    eprintln!("No hooks found in '{path}'.");
     return Ok(());
   }
-  println!("Configured hooks:");
+  let s = if n == 1 { "" } else { "s" };
+  eprintln!("Discovered {n} hook{s} in '{path}':");
   for (hook, spec) in &cfg.hooks {
     if opts.verbose {
-      println!("- {hook}: {spec:?}");
-    } else {
-      println!("- {hook}");
+      eprintln!("- {hook}: {spec:#}");
+      continue;
     }
+    eprintln!("- {hook}: {spec}");
   }
   Ok(())
 }
@@ -61,14 +67,77 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
 /// Handler for the `run` subcommand.
 pub fn handle_run(opts: &RunOpts) -> Result<(), RunnerError> {
   let cfg = HookConfig::discover(&std::env::current_dir()?)?;
+  if opts.hook.is_empty() {
+    eprintln!("No hook name specified.");
+    return Err(ConfigError::UnknownHook("".into()).into());
+  }
+  if !GIT_HOOKS.contains(&&*opts.hook) {
+    return Err(ConfigError::UnknownHook(opts.hook.clone()).into());
+  }
   if let Some(spec) = cfg.hooks.get(&opts.hook) {
     let mut runner = TaskRunner::new(&cfg);
     runner.run_spec(spec, &opts.hook, &opts.args)?;
   } else {
-    println!("Hook '{}' is not defined in configuration.", opts.hook);
+    eprintln!("Hook '{}' is not defined in configuration.", opts.hook);
   }
   Ok(())
 }
+
+macro_rules! file_name {
+  ($path:expr) => {
+    $path
+      .file_name()
+      .and_then(|_| $path.components().last().map(|c| c.as_os_str()))
+      .map(|o| o.to_string_lossy())
+      .unwrap_or_else(|| "<unknown>".into())
+  };
+}
+
+macro_rules! print_tasks {
+  ($cfg:expr) => {
+    let (kind, source, path) = match $cfg.source {
+      ConfigSource::DenoJson(ref path) => ("task", file_name!(path), path),
+      ConfigSource::PackageJson(ref path) => ("script", file_name!(path), path),
+    };
+    let mut all_tasks: Vec<&String> = Vec::new();
+
+    let mut deno_tasks: Vec<&String> = $cfg.deno_tasks.keys().collect();
+    deno_tasks.sort();
+    all_tasks.extend(deno_tasks.clone());
+
+    let mut node_scripts: Vec<&String> = $cfg.node_scripts.keys().collect();
+    node_scripts.sort();
+    all_tasks.extend(node_scripts.clone());
+
+    let mut n = all_tasks.len();
+    if n == 0 {
+      eprintln!("No {kind}s found in '{path}'.", path = path.display().to_string());
+    } else {
+      let s = if n == 1 { "" } else { "s" };
+      eprintln!("Discovered {n} {kind}{s} in '{path}':", path = path.display().to_string());
+
+      while n > 0 {
+        let name = &all_tasks[all_tasks.len() - n];
+        let cmd = if let Some(script) = $cfg.node_scripts.get(*name) {
+          script
+        } else if let Some(script) = $cfg.deno_tasks.get(*name) {
+          script
+        } else {
+          "<unknown>"
+        };
+        let named = (*name).clone();
+        let name = named.bold().cyan();
+        let cmd = cmd.replace('\n', " ").underlined();
+        let src = format!("({source})").italic().dim();
+        eprintln!("- {name} {src}");
+        eprintln!("  {cmd}");
+
+        n -= 1;
+      }
+    }
+  };
+}
+
 
 /// Handler for the `tasks` subcommand.
 pub fn handle_tasks(opts: &TasksOpts) -> Result<(), RunnerError> {
@@ -77,18 +146,18 @@ pub fn handle_tasks(opts: &TasksOpts) -> Result<(), RunnerError> {
   let mut all_tasks: HashSet<String> = HashSet::new();
   all_tasks.extend(cfg.node_scripts.keys().cloned());
   all_tasks.extend(cfg.deno_tasks.keys().cloned());
+
+  let path = cfg.source.as_path_buf();
+
   if let Some(ref run_task) = opts.run {
     if all_tasks.contains(run_task) {
       let mut runner = TaskRunner::new(&cfg);
       runner.run_named_task(run_task)?;
     } else {
-      println!("Task '{run_task}' not found.");
+      eprintln!("There is no '{run_task}' task defined in '{path}'.", path = path.display().to_string());
     }
   } else {
-    println!("Available tasks:");
-    for name in all_tasks {
-      println!("- {name}");
-    }
+    print_tasks!(&cfg);
   }
   Ok(())
 }
@@ -96,7 +165,7 @@ pub fn handle_tasks(opts: &TasksOpts) -> Result<(), RunnerError> {
 /// Handler for the `add` subcommand.
 pub fn handle_add(_opts: &AddOpts) -> Result<(), RunnerError> {
   // TODO: implement adding hooks via CLI to configuration files.
-  println!(
+  eprintln!(
     "Adding hooks via CLI is not yet implemented. Please edit your configuration file manually."
   );
   Ok(())
@@ -105,7 +174,7 @@ pub fn handle_add(_opts: &AddOpts) -> Result<(), RunnerError> {
 /// Handler for the `remove` subcommand.
 pub fn handle_remove(_opts: &RemoveOpts) -> Result<(), RunnerError> {
   // TODO: implement removing hooks via CLI from configuration files.
-  println!(
+  eprintln!(
     "Removing hooks via CLI is not yet implemented. Please edit your configuration file manually."
   );
   Ok(())
@@ -114,7 +183,7 @@ pub fn handle_remove(_opts: &RemoveOpts) -> Result<(), RunnerError> {
 /// Handler for the `update` subcommand.
 pub fn handle_update(_opts: &UpdateOpts) -> Result<(), RunnerError> {
   // TODO: implement updating hooks via CLI in configuration files.
-  println!(
+  eprintln!(
     "Updating hooks via CLI is not yet implemented. Please edit your configuration file manually."
   );
   Ok(())
@@ -181,9 +250,9 @@ impl<'cfg> TaskRunner<'cfg> {
       return Err(RunnerError::CircularDependency(name.to_string()));
     }
     self.visiting.insert(name.to_string());
-    let result = if let Some(cmd) = self.config.deno_tasks.get(name) {
+    let result = if self.config.deno_tasks.get(name).is_some() {
       // It's a Deno task.
-      self.exec_deno_task(cmd, extra_args)
+      self.exec_deno_task(name, extra_args)
     } else if let Some(script) = self.config.node_scripts.get(name) {
       // It's a Node script.
       self.exec_node_script(name, script, extra_args)

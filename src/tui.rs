@@ -4,6 +4,8 @@
 //! and [`ratatui`], which lists configured hooks and allows the user to
 //! execute a hook's tasks by pressing Enter. Press `q` to exit the dashboard.
 
+#![allow(dead_code)]
+
 use crate::config::HookConfig;
 use crate::runner::RunnerError;
 use crate::runner::TaskRunner;
@@ -38,30 +40,41 @@ use std::io::{self};
 /// or if configuration loading fails.
 pub fn handle_dashboard() -> Result<(), RunnerError> {
   let cfg = HookConfig::discover(&std::env::current_dir()?)?;
+
   // Collect hooks in a stable order for display.
   let mut hooks: Vec<(String, TaskSpec)> = cfg
     .hooks
     .iter()
     .map(|(name, spec)| (name.clone(), spec.clone()))
     .collect();
+
   hooks.sort_by(|a, b| a.0.cmp(&b.0));
+
   if hooks.is_empty() {
-    println!("No hooks defined.");
+    eprintln!(
+      "No hooks found in '{path}' config file.",
+      path = cfg.source.as_str()
+    );
     return Ok(());
   }
-  // Set up terminal.
+
+  let mut state = DashboardState::new(hooks);
   enable_raw_mode().map_err(|e| RunnerError::Io(e))?;
   let mut stdout = io::stdout();
   crossterm::execute!(stdout, EnterAlternateScreen)
     .map_err(|e| RunnerError::Io(e))?;
+
   let backend = CrosstermBackend::new(stdout);
   let mut terminal = Terminal::new(backend).map_err(|e| RunnerError::Io(e))?;
-  let mut state = DashboardState::new(hooks);
+
   let result = run_dashboard(&mut terminal, &cfg, &mut state);
+
   // Restore terminal.
   disable_raw_mode().map_err(|e| RunnerError::Io(e))?;
+
   crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)
     .map_err(|e| RunnerError::Io(e))?;
+
   terminal.show_cursor().map_err(|e| RunnerError::Io(e))?;
   result
 }
@@ -78,10 +91,12 @@ pub fn run_dashboard(
         // Split into two panels: left for hooks, right for description.
         let chunks = Layout::default()
           .direction(Direction::Horizontal)
-          .constraints(
-            &[Constraint::Percentage(40), Constraint::Percentage(60)]
-          )
+          .constraints(&[
+            Constraint::Percentage(40),
+            Constraint::Percentage(60),
+          ])
           .split(f.area());
+
         // Hook list
         let items: Vec<ListItem> = state
           .hooks
@@ -90,20 +105,25 @@ pub fn run_dashboard(
           .map(|(i, (name, _))| {
             let content = if i == state.selected {
               Span::styled(
-                format!("> {}", name),
+                format!("> {name}"),
                 Style::default()
                   .fg(Color::Yellow)
-                  .add_modifier(Modifier::BOLD | Modifier::UNDERLINED).underline_color(Color::);
+                  .add_modifier(Modifier::BOLD)
+                  .add_modifier(Modifier::UNDERLINED)
+                  .underline_color(Color::LightYellow),
               )
             } else {
-              Span::raw(format!("  {name}", name))
+              Span::raw(format!("  {name}"))
             };
             ListItem::new(content)
           })
           .collect();
+
         let list = List::new(items)
           .block(Block::default().title("Hooks").borders(Borders::ALL));
+
         f.render_widget(list, chunks[0]);
+
         // Description panel
         let (_, spec) = &state.hooks[state.selected];
         let desc = format!("{spec:?}");
@@ -114,9 +134,11 @@ pub fn run_dashboard(
               .borders(Borders::ALL),
           )
           .wrap(ratatui::widgets::Wrap { trim: true });
+
         f.render_widget(paragraph, chunks[1]);
       })
       .map_err(|e| RunnerError::Io(e))?;
+
     // Handle events.
     if event::poll(std::time::Duration::from_millis(200))
       .map_err(|e| RunnerError::Io(e))?
@@ -137,10 +159,7 @@ pub fn run_dashboard(
             // Execute selected hook.
             let (name, spec) = &state.hooks[state.selected];
             let mut runner = TaskRunner::new(cfg);
-            if let Err(err) = runner.run_spec(spec, name, &[]) {
-              // Display error on console once the dashboard exits.
-              eprintln!("Hook execution error: {err}");
-            }
+            runner.run_spec(spec, name, &[])?;
           }
           KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             break;
@@ -154,13 +173,40 @@ pub fn run_dashboard(
 }
 
 /// Internal state for the dashboard.
-struct DashboardState {
-  hooks:    Vec<(String, TaskSpec)>,
-  selected: usize,
+pub struct DashboardState {
+  pub running:  bool,
+  pub hooks:    Vec<(String, TaskSpec)>,
+  pub selected: usize,
 }
 
 impl DashboardState {
-  fn new(hooks: Vec<(String, TaskSpec)>) -> Self {
-    Self { hooks, selected: 0 }
+  pub const fn new(hooks: Vec<(String, TaskSpec)>) -> Self {
+    Self {
+      hooks,
+      selected: 0,
+      running: false,
+    }
+  }
+
+  pub fn start(&mut self) -> bool {
+    if !self.running {
+      self.running = true;
+      return true;
+    }
+    false
+  }
+
+  pub fn stop(&mut self) -> bool {
+    if self.running {
+      self.running = false;
+      return true;
+    }
+    false
+  }
+}
+
+impl Default for DashboardState {
+  fn default() -> Self {
+    Self::new(Vec::new())
   }
 }

@@ -8,8 +8,10 @@
 //! addition, the Node `scripts` field and Deno `tasks` field are captured
 //! so that tasks can reference them.
 
+use crate::constants::GIT_HOOKS;
 use crate::task::TaskSpec;
 use crate::task::TaskSpecParseError;
+use ::derive_more::IsVariant;
 use serde_json::Value;
 use serde_json::{self};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use thiserror::Error;
 pub struct HookConfig {
   /// Path to the configuration file used (either deno.json/deno.jsonc or
   /// package.json).
+  #[allow(dead_code)]
   pub source:          ConfigSource,
   /// Mapping of hook names (e.g. "pre-commit") to their task specification.
   pub hooks:           HashMap<String, TaskSpec>,
@@ -37,10 +40,48 @@ pub struct HookConfig {
 }
 
 /// Enum describing where the configuration was loaded from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, IsVariant)]
 pub enum ConfigSource {
   DenoJson(PathBuf),
   PackageJson(PathBuf),
+}
+
+impl ConfigSource {
+  /// Get a [`PathBuf`] reference to the configuration file.
+  pub const fn as_path_buf(&self) -> &PathBuf {
+    match self {
+      ConfigSource::DenoJson(p) => p,
+      ConfigSource::PackageJson(p) => p,
+    }
+  }
+
+  /// Get a [`Path`] reference to the configuration file.
+  pub fn as_path(&self) -> &Path {
+    match self {
+      ConfigSource::DenoJson(p) => p.as_path(),
+      ConfigSource::PackageJson(p) => p.as_path(),
+    }
+  }
+
+  /// Get the file name of the configuration file.
+  #[allow(dead_code)]
+  pub fn file_name(&self) -> &str {
+    match self {
+      ConfigSource::DenoJson(p) => p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("deno.json"),
+      ConfigSource::PackageJson(p) => p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("package.json"),
+    }
+  }
+
+  /// Get a string representation of the configuration source.
+  pub fn as_str(&self) -> &str {
+    self.as_path().to_str().unwrap_or("")
+  }
 }
 
 /// Errors that may occur while loading configuration.
@@ -60,6 +101,9 @@ pub enum ConfigError {
   /// The hooks field exists but could not be parsed into a task specification.
   #[error("invalid hook definition for '{0}': {1}")]
   InvalidHook(String, #[source] TaskSpecParseError),
+  /// An unknown or unsupported Git hook name was specified.
+  #[error("unknown Git hook name '{0}'. Supported hooks are: {supported_hooks}", supported_hooks = GIT_HOOKS.join(", "))]
+  UnknownHook(String),
 }
 
 impl HookConfig {
@@ -95,6 +139,9 @@ impl HookConfig {
     let mut hooks = HashMap::new();
     if let Value::Object(map) = hooks_value {
       for (hook_name, spec_value) in map {
+        if !GIT_HOOKS.contains(&&*hook_name) {
+          return Err(ConfigError::UnknownHook(hook_name));
+        }
         match TaskSpec::from_json(&spec_value) {
           Ok(spec) => {
             hooks.insert(hook_name, spec);
@@ -115,11 +162,20 @@ impl HookConfig {
           }
           // Deno tasks may also be objects with command/description etc.
           Value::Object(obj) => {
-            if let Some(Value::String(cmd)) =
-              obj.get("cmd").or_else(|| obj.get("command"))
-            {
-              deno_tasks.insert(name.clone(), cmd.clone());
+            let mut cmd_parts = Vec::new();
+            if let Some(Value::Array(deps)) = obj.get("dependencies") {
+              // If only dependencies are defined, we can join them with "&&".
+              for dep in deps {
+                if let Value::String(task) = dep {
+                  cmd_parts.push(format!("deno task {task}"));
+                }
+              }
             }
+            if let Some(Value::String(cmd)) = obj.get("command") {
+              cmd_parts.push(cmd.clone());
+            }
+            let joined = cmd_parts.join(" && ");
+            deno_tasks.insert(name.clone(), joined);
           }
           _ => {}
         }
@@ -138,13 +194,16 @@ impl HookConfig {
   fn load_package_json(path: &Path) -> Result<Self, ConfigError> {
     let content = fs::read_to_string(path)
       .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-    let value: Value = serde_json::from_str(&content)
+    let value: Value = serde_json::from_str(&content.trim())
       .map_err(|e| ConfigError::Json(path.to_path_buf(), e))?;
     // Extract hooks mapping.
     let hooks_value = value.get("hooks").cloned().unwrap_or(Value::Null);
     let mut hooks = HashMap::new();
     if let Value::Object(map) = hooks_value {
       for (hook_name, spec_value) in map {
+        if !GIT_HOOKS.contains(&&*hook_name) {
+          return Err(ConfigError::UnknownHook(hook_name));
+        }
         match TaskSpec::from_json(&spec_value) {
           Ok(spec) => {
             hooks.insert(hook_name, spec);
@@ -164,11 +223,13 @@ impl HookConfig {
         }
       }
     }
+
     // Determine preferred package manager.
     let package_manager = value
       .get("packageManager")
       .and_then(|v| v.as_str())
       .map(|s| s.to_string());
+
     Ok(HookConfig {
       source: ConfigSource::PackageJson(path.to_path_buf()),
       hooks,

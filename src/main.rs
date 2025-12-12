@@ -19,17 +19,20 @@ use cli::Cli;
 use cli::Commands;
 use std::process;
 
+pub use constants::*;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HukError {
   /// Wrapper around runner errors.
   #[error(transparent)]
   Runner(#[from] runner::RunnerError),
+
   /// Wrapper around installation errors.
   #[error(transparent)]
   Install(#[from] install::InstallError),
 
   #[error(transparent)]
-  TaskSpecParse(#[from] task::TaskSpecParseError),
+  Parse(#[from] task::TaskSpecParseError),
 
   #[error(transparent)]
   Config(#[from] config::ConfigError),
@@ -41,7 +44,9 @@ fn main() {
 
   // Dispatch the requested subcommand.
   let result: Result<(), HukError> = match &cli.command {
-    Commands::Install(opts) => install::handle_install(opts).map_err(|e| e.into()),
+    Commands::Install(opts) => {
+      install::handle_install(opts).map_err(|e| e.into())
+    }
     Commands::List(opts) => runner::handle_list(opts).map_err(|e| e.into()),
     Commands::Run(opts) => runner::handle_run(opts).map_err(|e| e.into()),
     Commands::Tasks(opts) => runner::handle_tasks(opts).map_err(|e| e.into()),
