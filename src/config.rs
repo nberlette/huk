@@ -9,9 +9,10 @@
 //! so that tasks can reference them.
 
 use crate::constants::GIT_HOOKS;
+use crate::handlers::RunnerError;
 use crate::task::TaskSpec;
 use crate::task::TaskSpecParseError;
-use ::derive_more::IsVariant;
+use derive_more::IsVariant;
 use serde_json::Value;
 use serde_json::{self};
 use std::collections::HashMap;
@@ -44,6 +45,10 @@ pub struct HookConfig {
 pub enum ConfigSource {
   DenoJson(PathBuf),
   PackageJson(PathBuf),
+  #[cfg(feature = "cargo_toml_config")]
+  CargoToml(PathBuf),
+  #[cfg(feature = "custom_config")]
+  Custom(PathBuf),
 }
 
 impl ConfigSource {
@@ -52,6 +57,10 @@ impl ConfigSource {
     match self {
       ConfigSource::DenoJson(p) => p,
       ConfigSource::PackageJson(p) => p,
+      #[cfg(feature = "cargo_toml_config")]
+      ConfigSource::CargoToml(p) => p,
+      #[cfg(feature = "custom_config")]
+      ConfigSource::Custom(p) => p,
     }
   }
 
@@ -60,27 +69,41 @@ impl ConfigSource {
     match self {
       ConfigSource::DenoJson(p) => p.as_path(),
       ConfigSource::PackageJson(p) => p.as_path(),
+      #[cfg(feature = "cargo_toml_config")]
+      ConfigSource::CargoToml(p) => p.as_path(),
+      #[cfg(feature = "custom_config")]
+      ConfigSource::Custom(p) => p.as_path(),
+    }
+  }
+
+  /// Get the default file name for the configuration file based on its type.
+  fn default_file_name(&self) -> &str {
+    match self {
+      ConfigSource::DenoJson(_) => "deno.json",
+      ConfigSource::PackageJson(_) => "package.json",
+      #[cfg(feature = "cargo_toml_config")]
+      ConfigSource::CargoToml(_) => "Cargo.toml",
+      #[cfg(feature = "custom_config")]
+      ConfigSource::Custom(_) => ".hukrc",
     }
   }
 
   /// Get the file name of the configuration file.
   #[allow(dead_code)]
   pub fn file_name(&self) -> &str {
-    match self {
-      ConfigSource::DenoJson(p) => p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("deno.json"),
-      ConfigSource::PackageJson(p) => p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("package.json"),
-    }
+    self
+      .as_path_buf()
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or_else(|| self.default_file_name())
   }
 
   /// Get a string representation of the configuration source.
   pub fn as_str(&self) -> &str {
-    self.as_path().to_str().unwrap_or("")
+    self
+      .as_path()
+      .to_str()
+      .unwrap_or_else(|| self.default_file_name())
   }
 }
 
@@ -194,7 +217,7 @@ impl HookConfig {
   fn load_package_json(path: &Path) -> Result<Self, ConfigError> {
     let content = fs::read_to_string(path)
       .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-    let value: Value = serde_json::from_str(&content.trim())
+    let value: Value = serde_json::from_str(content.trim())
       .map_err(|e| ConfigError::Json(path.to_path_buf(), e))?;
     // Extract hooks mapping.
     let hooks_value = value.get("hooks").cloned().unwrap_or(Value::Null);
@@ -247,16 +270,34 @@ impl HookConfig {
 /// containing comment markers. The intent is simply to allow JSONC files
 /// commonly used for Deno configuration to parse as JSON. If comment markers
 /// appear inside string literals this function may remove valid content.
-fn strip_json_comments(input: &str) -> String {
+pub(crate) fn strip_json_comments(input: &str) -> String {
   let mut output = String::with_capacity(input.len());
   let mut chars = input.chars().peekable();
+  let mut in_string = false;
+  let mut escaped = false;
   while let Some(c) = chars.next() {
+    if in_string {
+      output.push(c);
+      if escaped {
+        escaped = false;
+      } else if c == '\\' {
+        escaped = true;
+      } else if c == '"' {
+        in_string = false;
+      }
+      continue;
+    }
+    if c == '"' {
+      in_string = true;
+      output.push(c);
+      continue;
+    }
     if c == '/' {
       match chars.peek() {
         Some('/') => {
           // Skip until newline
           chars.next();
-          while let Some(next) = chars.next() {
+          for next in chars.by_ref() {
             if next == '\n' {
               break;
             }
@@ -267,11 +308,13 @@ fn strip_json_comments(input: &str) -> String {
           // Skip block comment
           chars.next();
           while let Some(next) = chars.next() {
-            if next == '*' {
-              if let Some('/') = chars.peek() {
-                chars.next();
-                break;
-              }
+            if next == '*'
+              && let Some('/') = chars.peek()
+            {
+              chars.next();
+              break;
+            } else if next == '\n' {
+              output.push('\n');
             }
           }
         }
@@ -282,4 +325,210 @@ fn strip_json_comments(input: &str) -> String {
     }
   }
   output
+}
+
+/// Parse a task specification provided from the CLI or TUI. If the string looks
+/// like JSON (starts with `{` or `[`), attempt to parse it accordingly;
+/// otherwise treat it as a simple string command or task name.
+pub(crate) fn parse_spec_input(spec: &str) -> Result<TaskSpec, RunnerError> {
+  let trimmed = spec.trim();
+  if trimmed.starts_with('{') || trimmed.starts_with('[') {
+    let value: Value = serde_json::from_str(trimmed)?;
+    TaskSpec::from_json(&value).map_err(RunnerError::InvalidTaskSpec)
+  } else {
+    Ok(TaskSpec::Single(trimmed.to_string()))
+  }
+}
+
+/// Parse one or more task specifications. If multiple values are supplied they
+/// are combined into a sequence. Individual values may themselves be JSON
+/// arrays, objects, or simple strings.
+pub(crate) fn parse_specs_inputs(
+  specs: &[String],
+) -> Result<TaskSpec, RunnerError> {
+  if specs.is_empty() {
+    return Err(RunnerError::InvalidTaskSpec(
+      TaskSpecParseError::InvalidType("empty spec".into()),
+    ));
+  }
+  if specs.len() == 1 {
+    return parse_spec_input(&specs[0]);
+  }
+
+  let mut sequence = Vec::new();
+  for s in specs {
+    let parsed = parse_spec_input(s)?;
+    match parsed {
+      TaskSpec::Sequence(list) => {
+        // Flatten nested sequences for convenience.
+        sequence.extend(list);
+      }
+      other => sequence.push(other),
+    }
+  }
+  Ok(TaskSpec::Sequence(sequence))
+}
+
+/// Merge a new specification into an existing one. When `replace` is false,
+/// the new spec is appended (flattening sequences) instead of overwriting.
+pub(crate) fn merge_specs(
+  existing: Option<&TaskSpec>,
+  incoming: TaskSpec,
+  replace: bool,
+) -> TaskSpec {
+  if replace {
+    return incoming;
+  }
+  let Some(current) = existing else {
+    return incoming;
+  };
+
+  let mut seq = match current {
+    TaskSpec::Sequence(list) => list.clone(),
+    other => vec![other.clone()],
+  };
+
+  match incoming {
+    TaskSpec::Sequence(list) => seq.extend(list),
+    other => seq.push(other),
+  }
+
+  TaskSpec::Sequence(seq)
+}
+
+pub(crate) fn remove_task_from_spec(
+  current: &TaskSpec,
+  target: &TaskSpec,
+) -> Option<TaskSpec> {
+  match current {
+    TaskSpec::Single(_) | TaskSpec::Detailed { .. } => {
+      if current == target {
+        None
+      } else {
+        Some(current.clone())
+      }
+    }
+    TaskSpec::Sequence(list) => {
+      let mut next: Vec<TaskSpec> = list
+        .iter()
+        .filter_map(|item| remove_task_from_spec(item, target))
+        .collect();
+      if next.is_empty() {
+        None
+      } else if next.len() == 1 {
+        Some(next.remove(0))
+      } else {
+        Some(TaskSpec::Sequence(next))
+      }
+    }
+  }
+}
+
+pub(crate) fn ensure_valid_hook_name(hook: &str) -> Result<(), RunnerError> {
+  if GIT_HOOKS.contains(&hook) {
+    Ok(())
+  } else {
+    Err(ConfigError::UnknownHook(hook.to_string()).into())
+  }
+}
+
+pub(crate) fn load_config_value(
+  source: &ConfigSource,
+) -> Result<Value, RunnerError> {
+  let path = source.as_path();
+  let content = fs::read_to_string(path)?;
+  let content = match source {
+    ConfigSource::DenoJson(_) => strip_json_comments(&content),
+    ConfigSource::PackageJson(_) => content,
+  };
+  let value: Value = serde_json::from_str(&content)?;
+  Ok(value)
+}
+
+// TODO(nberlette): implement support for arbitrary config files in
+// different formats (JSON/JSONC, TOML, and YAML). right now we only
+// allow deno.json{,c} or package.json files, but in the near duture
+// we should allow the user to specify a custom config file path/type
+// and (for advanced users) even specify a custom path within the file
+// to the hooks and tasks maps. this would allow us to support Cargo.toml
+// files out of the box and also our own custom .hukrc.{json,toml,yml}
+// files too, if desired.
+
+// pub(crate) fn load_json_config_value(
+//   source: &ConfigSource,
+// ) -> Result<Value, RunnerError> {
+//   let path = source.as_path();
+//   let content = fs::read_to_string(path)?;
+//   let content = match source {
+//     ConfigSource::DenoJson(_) => strip_json_comments(&content),
+//     ConfigSource::PackageJson(_) => content,
+//   };
+//   let value: Value = serde_json::from_str(&content)?;
+//   Ok(value)
+// }
+
+// pub(crate) fn load_toml_config_value(
+//   source: &ConfigSource,
+// ) -> Result<toml::Value, RunnerError> {
+//   let path = source.as_path();
+//   let content = fs::read_to_string(path)?;
+//   let value: toml::Value = toml::from_str(&content)
+//     .map_err(|e| RunnerError::Serialize(e.to_string()))?;
+//   Ok(value)
+// }
+
+// pub(crate) fn load_yaml_config_value(
+//   source: &ConfigSource,
+// ) -> Result<serde_yaml::Value, RunnerError> {
+//   let path = source.as_path();
+//   let content = fs::read_to_string(path)?;
+//   let value: serde_yaml::Value = serde_yaml::from_str(&content)
+//     .map_err(|e| RunnerError::Serialize(e.to_string()))?;
+//   Ok(value)
+// }
+
+pub(crate) fn write_config_value(
+  source: &ConfigSource,
+  value: &Value,
+) -> Result<(), RunnerError> {
+  let mut content = serde_json::to_string_pretty(value)?;
+  content.push('\n');
+  fs::write(source.as_path(), content)?;
+  Ok(())
+}
+
+pub(crate) fn with_hooks_map<F>(
+  value: &mut Value,
+  source: &ConfigSource,
+  mutator: F,
+) -> Result<(), RunnerError>
+where
+  F: FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), RunnerError>,
+{
+  let obj = value.as_object_mut().ok_or_else(|| {
+    RunnerError::InvalidConfigShape(source.as_str().to_string())
+  })?;
+  let hooks_value = obj
+    .entry("hooks")
+    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+  if !hooks_value.is_object() {
+    *hooks_value = Value::Object(serde_json::Map::new());
+  }
+  if let Some(map) = hooks_value.as_object_mut() {
+    mutator(map)?;
+    sort_hooks(map);
+    Ok(())
+  } else {
+    Err(RunnerError::InvalidConfigShape(source.as_str().to_string()))
+  }
+}
+
+pub(crate) fn sort_hooks(map: &mut serde_json::Map<String, Value>) {
+  let mut entries: Vec<(String, Value)> =
+    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+  entries.sort_by(|a, b| a.0.cmp(&b.0));
+  map.clear();
+  for (k, v) in entries {
+    map.insert(k, v);
+  }
 }
