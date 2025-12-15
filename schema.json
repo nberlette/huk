@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nberlette/huk/main/schema_v1.json",
+  "title": "huk configuration (v1)",
+  "description": "Schema for the huk hook configuration embedded in deno.json/deno.jsonc or package.json files.",
+  "type": "object",
+  "properties": {
+    "hooks": {
+      "title": "Git hooks",
+      "description": "Map of Git hook names to huk task specifications. Only standard hook names are allowed.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/hook_name" },
+      "additionalProperties": { "$ref": "#/$defs/hook_task" },
+      "examples": [
+        {
+          "pre-commit": [
+            "fmt",
+            { "command": "deno test", "description": "Run unit tests" },
+            { "dependencies": ["lint"], "description": "Ensure code is linted" }
+          ],
+          "pre-push": "deno task test"
+        }
+      ]
+    },
+    "tasks": {
+      "title": "Deno tasks",
+      "description": "Optional Deno task definitions; huk can reference these by name from hook tasks.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Deno task name (usually lower-case with dashes or colons)."
+      },
+      "additionalProperties": { "$ref": "#/$defs/deno_task" },
+      "examples": [
+        {
+          "fmt": "deno fmt",
+          "lint": {
+            "command": "deno lint",
+            "dependencies": ["fmt"]
+          }
+        }
+      ]
+    },
+    "scripts": {
+      "title": "Node scripts",
+      "description": "Optional Node.js scripts from package.json; huk can call these by name.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Script name such as npm/yarn/pnpm script."
+      },
+      "additionalProperties": { "$ref": "#/$defs/node_script" },
+      "examples": [
+        {
+          "lint": "eslint .",
+          "test": "npm run lint && vitest"
+        }
+      ]
+    },
+    "packageManager": {
+      "title": "Preferred package manager",
+      "description": "Optional Node package manager identifier used when executing scripts (npm, pnpm, yarn, etc.).",
+      "type": "string",
+      "minLength": 1,
+      "examples": ["pnpm@9.1.4", "npm@10.7.0", "yarn@4.1.0"]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "hook_name": {
+      "description": "One of the Git hook names supported by huk.",
+      "type": "string",
+      "enum": [
+        "pre-applypatch",
+        "pre-auto-gc",
+        "pre-checkout",
+        "pre-commit",
+        "pre-merge-commit",
+        "pre-push",
+        "pre-rebase",
+        "pre-receive",
+        "prepare-commit-msg",
+        "applypatch-msg",
+        "commit-msg",
+        "post-applypatch",
+        "post-checkout",
+        "post-commit",
+        "post-merge",
+        "post-receive",
+        "post-rewrite",
+        "post-update",
+        "push-to-checkout",
+        "fsmonitor-watchman",
+        "sendemail-validate",
+        "update"
+      ],
+      "examples": ["pre-commit", "commit-msg", "pre-push"]
+    },
+    "hook_task": {
+      "description": "Task specification attached to a Git hook. Strings reference a task/script name or raw command; objects provide more detail; arrays run tasks in sequence.",
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Reference a Deno task, Node script, other hook task by name, or provide an inline shell command.",
+          "examples": ["lint", "deno task test", "npm run lint && npm test"]
+        },
+        {
+          "$ref": "#/$defs/task_spec"
+        },
+        {
+          "type": "array",
+          "description": "A sequence of tasks executed in order.",
+          "items": { "$ref": "#/$defs/hook_task" },
+          "minItems": 1,
+          "examples": [
+            [
+              "fmt",
+              { "command": "deno test" },
+              { "dependencies": ["lint"] }
+            ]
+          ]
+        }
+      ]
+    },
+    "task_spec": {
+      "title": "Task object",
+      "description": "Detailed task definition. Must specify either a command/cmd or one or more dependencies/depends.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command to execute for this task.",
+          "examples": ["deno fmt", "npm run lint", "git add -A"]
+        },
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Alias for command.",
+          "examples": ["pnpm lint"]
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the task.",
+          "examples": ["Run tests", "Ensure repository is formatted"]
+        },
+        "dependencies": {
+          "$ref": "#/$defs/task_deps"
+        },
+        "depends": {
+          "$ref": "#/$defs/task_deps"
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["command"] },
+        { "required": ["cmd"] },
+        { "required": ["dependencies"] },
+        { "required": ["depends"] }
+      ],
+      "examples": [
+        {
+          "command": "deno test",
+          "description": "Run unit tests"
+        },
+        {
+          "dependencies": ["fmt", "lint"],
+          "description": "Ensure formatting and linting tasks run first"
+        }
+      ]
+    },
+    "task_deps": {
+      "description": "Tasks that must run before this task.",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "examples": [["lint"], ["fmt", "lint"]]
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "examples": ["lint"]
+        }
+      ]
+    },
+    "deno_task": {
+      "description": "A Deno task definition as accepted by deno.json. Huk reads the command and optional dependencies so hooks can reference the task name.",
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "examples": ["deno fmt", "deno lint --unstable"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Shell command to run when the Deno task is invoked.",
+              "examples": ["deno test --allow-all"]
+            },
+            "description": {
+              "type": "string",
+              "description": "Optional description shown by `deno task`.",
+              "examples": ["Lint the project"]
+            },
+            "dependencies": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1,
+              "description": "Other Deno tasks that must run first.",
+              "examples": [["fmt"], ["build", "fmt:check"]]
+            }
+          },
+          "anyOf": [
+            { "required": ["command"] },
+            { "required": ["dependencies"] }
+          ],
+          "additionalProperties": true,
+          "examples": [
+            { "command": "deno lint --fix", "dependencies": ["fmt"] }
+          ]
+        }
+      ]
+    },
+    "node_script": {
+      "description": "Command string for a package.json script.",
+      "type": "string",
+      "minLength": 1,
+      "examples": ["eslint .", "vitest run --runInBand"]
+    }
+  },
+  "examples": [
+    {
+      "tasks": {
+        "fmt": "deno fmt",
+        "lint": {
+          "command": "deno lint",
+          "dependencies": ["fmt"],
+          "description": "Lint the project after formatting the codebase"
+        },
+        "test": {
+          "command": "deno test --allow-all",
+          "dependencies": ["lint"],
+          "description": "Run all unit tests"
+        }
+      },
+      "hooks": {
+        "pre-commit": ["fmt", "lint", "test"],
+        "pre-push": "deno task test"
+      }
+    },
+    {
+      "scripts": {
+        "lint": "eslint .",
+        "test": "npm run lint && vitest"
+      },
+      "packageManager": "pnpm@9.1.4",
+      "hooks": {
+        "pre-commit": [
+          "lint",
+          { "command": "npm run test", "description": "Run tests" }
+        ],
+        "commit-msg": { "command": "echo Validate commit message" }
+      }
+    }
+  ]
+}
