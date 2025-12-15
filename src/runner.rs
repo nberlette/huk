@@ -11,6 +11,7 @@ use std::process::Command;
 use std::process::ExitStatus;
 
 use ::derive_more::IsVariant;
+use ::serde_json::json;
 use moos::CowStr;
 use serde::Serialize;
 use serde_json::Value;
@@ -91,11 +92,6 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
       Full { name: String, spec: Option<Value> },
     }
 
-    #[derive(Serialize)]
-    struct HookList {
-      hooks: Vec<HookEntry>,
-    }
-
     let mut hooks: Vec<HookEntry>;
 
     if opts.all {
@@ -124,7 +120,22 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
         .collect();
     }
 
-    let payload = HookList { hooks };
+    let mut payload: serde_json::value::Value = json!({
+      "source": path,
+      "hooks": hooks,
+    });
+
+    if opts.name_only {
+      payload = json!(
+        hooks
+          .into_iter()
+          .map(|h| match h {
+            HookEntry::Name(name) => name,
+            HookEntry::Full { name, .. } => name,
+          })
+          .collect::<Vec<String>>()
+      );
+    }
 
     if opts.json {
       let out = if opts.compact {
@@ -169,14 +180,16 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
   }
   let mut i = 0;
   for (hook, spec) in hooks_sorted {
-    if i != 0 && !opts.compact && !opts.name_only && !opts.all {
+    if i != 0 && !opts.all && !opts.compact && !opts.name_only {
       eprintln!();
     }
     i += 1;
     if opts.name_only || opts.all {
-      eprintln!("- {hook}");
-    } else if opts.compact {
-      eprintln!("- {hook}");
+      println!("- {hook}");
+      continue;
+    }
+    if opts.compact {
+      println!("- {hook}");
       let spec_str = spec.to_string();
       let _info: String = spec_str.replace('\n', "\n  ");
     } else {
@@ -205,6 +218,9 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
           let trimmed: &str = line.trim_start();
           let (num_part, rest): (&str, &str) =
             trimmed.split_at(trimmed.find(' ').unwrap_or(trimmed.len()));
+          let num_part = num_part.trim_end_matches(':').trim_end_matches('.');
+          let num_part = format!("{num_part}.");
+
           // in the rest part, attempt to resolve the task name to its
           // configured command, printing them on the same line as the
           // number, but dimming the number part and emboldening/

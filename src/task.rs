@@ -73,12 +73,12 @@ impl TaskSpec {
         if let Some(cmd) = command {
           map.insert("command".into(), Value::String(cmd.clone()));
         }
-        if let Some(desc) = description {
-          map.insert("description".into(), Value::String(desc.clone()));
-        }
         if !dependencies.is_empty() {
           let deps = dependencies.iter().cloned().map(Value::String).collect();
           map.insert("dependencies".into(), Value::Array(deps));
+        }
+        if let Some(desc) = description {
+          map.insert("description".into(), Value::String(desc.clone()));
         }
         Value::Object(map)
       }
