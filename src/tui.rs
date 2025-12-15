@@ -168,8 +168,7 @@ fn editable_spec(spec: &TaskSpec) -> String {
   }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
   #[default]
   Hooks,
@@ -188,7 +187,6 @@ impl Focus {
     self.next()
   }
 }
-
 
 /// Internal state for the dashboard.
 #[derive(Clone, Constructor)]
@@ -610,14 +608,15 @@ impl Drawable for DashboardState<'_> {
     f.render_widget(status, layout[3]);
 
     if let Some(prompt) = self.prompt.as_ref()
-      && prompt.needs_cursor() {
-        let inner_width = layout[3].width.saturating_sub(2).max(1);
-        let inner_height = layout[3].height.saturating_sub(2).max(1);
-        let (cx, cy) = prompt.visual_cursor(inner_width);
-        let x = layout[3].x + 1 + cx.min(inner_width.saturating_sub(1));
-        let y = layout[3].y + 1 + cy.min(inner_height.saturating_sub(1));
-        f.set_cursor_position((x, y));
-      }
+      && prompt.needs_cursor()
+    {
+      let inner_width = layout[3].width.saturating_sub(2).max(1);
+      let inner_height = layout[3].height.saturating_sub(2).max(1);
+      let (cx, cy) = prompt.visual_cursor(inner_width);
+      let x = layout[3].x + 1 + cx.min(inner_width.saturating_sub(1));
+      let y = layout[3].y + 1 + cy.min(inner_height.saturating_sub(1));
+      f.set_cursor_position((x, y));
+    }
   }
 }
 
