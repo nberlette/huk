@@ -7,11 +7,15 @@
 //! unspecified, it falls back to the repository's `.git/hooks` directory.
 
 use crate::cli::InstallOpts;
+use crate::cli::UninstallOpts;
 use crate::config::ConfigError;
 use crate::config::HookConfig;
 use std::env;
 use std::fs;
+#[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;
@@ -32,19 +36,22 @@ pub enum InstallError {
 
 /// Handle the `install` subcommand.
 pub fn handle_install(opts: &InstallOpts) -> Result<(), InstallError> {
-  let cfg = HookConfig::discover(
-    &env::current_dir().map_err(|e| InstallError::Io(e))?,
-  )?;
-  let hooks_dir = find_git_hooks_dir()?;
+  let cfg =
+    HookConfig::discover(&env::current_dir().map_err(InstallError::Io)?)?;
+  let hooks_dir = find_git_hooks_dir(opts.hooks_dir.clone())?;
+  // ensure the hooks directory exists.
   fs::create_dir_all(&hooks_dir)?;
   // Determine the path to the currently running binary. If this fails,
   // fallback to calling `huk` from PATH.
   let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("huk"));
 
-  for (hook_name, _spec) in &cfg.hooks {
+  let mut hook_names: Vec<&String> = cfg.hooks.keys().collect();
+  hook_names.sort();
+
+  for hook_name in hook_names {
     let script_path = hooks_dir.join(hook_name);
     if script_path.exists() && !opts.force {
-      println!(
+      eprintln!(
         "Skipping existing hook script '{}'; use --force to overwrite",
         script_path.display()
       );
@@ -61,36 +68,97 @@ pub fn handle_install(opts: &InstallOpts) -> Result<(), InstallError> {
     let mut perms = fs::metadata(&script_path)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&script_path, perms)?;
-    println!("Installed hook script: {}", script_path.display());
+    eprintln!("Installed hook script: {}", script_path.display());
+  }
+  Ok(())
+}
+
+pub fn handle_uninstall(opts: &UninstallOpts) -> Result<(), InstallError> {
+  let hooks_dir = find_git_hooks_dir(opts.hooks_dir.clone())?;
+  let cfg =
+    HookConfig::discover(&env::current_dir().map_err(InstallError::Io)?)?;
+
+  let mut hook_names: Vec<&String> = cfg.hooks.keys().collect();
+  hook_names.sort();
+
+  if hook_names.is_empty() {
+    if opts.hooks.is_empty() {
+      eprintln!("No hooks configured; nothing to uninstall.");
+      return Ok(());
+    }
+    eprintln!("Uninstalling all configured hooks...");
+    for hook_name in &opts.hooks {
+      let script_path = hooks_dir.join(hook_name);
+      // look for a backup file in case we overwrote an existing hook on
+      // install.
+      let maybe_backup_path = hooks_dir.join(format!("{}.bak", hook_name));
+      if script_path.exists() {
+        fs::remove_file(&script_path)?;
+        if maybe_backup_path.exists() {
+          fs::rename(&maybe_backup_path, &script_path)?;
+          eprintln!(
+            "Restored backup of original hook script: {}",
+            script_path.display()
+          );
+        }
+        eprintln!("Removed hook script: {}", script_path.display());
+      } else {
+        eprintln!(
+          "Hook script '{}' does not exist; skipping",
+          script_path.display()
+        );
+      }
+    }
+  } else {
+    for hook_name in hook_names {
+      if opts.hooks.is_empty() || opts.hooks.contains(hook_name) {
+        let script_path = hooks_dir.join(hook_name);
+        if script_path.exists() {
+          fs::remove_file(&script_path)?;
+          eprintln!("Removed hook script: {}", script_path.display());
+        } else {
+          eprintln!(
+            "Hook script '{}' does not exist; skipping",
+            script_path.display()
+          );
+        }
+      }
+    }
   }
   Ok(())
 }
 
 /// Determine the git hooks directory using `git config core.hooksPath` if set,
 /// otherwise defaulting to `.git/hooks` relative to the repository root.
-fn find_git_hooks_dir() -> Result<PathBuf, InstallError> {
+fn find_git_hooks_dir(
+  user_hooks_dir: Option<String>,
+) -> Result<PathBuf, InstallError> {
+  // If the user provided a custom hooks directory, try to use that first.
+  if let Some(dir) = user_hooks_dir {
+    return Ok(PathBuf::from(dir));
+  }
   // Try `git config core.hooksPath`.
   let output = Command::new("git")
     .args(["config", "--get", "core.hooksPath"])
     .output();
-  if let Ok(out) = output {
-    if out.status.success() {
-      let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-      if !path_str.is_empty() {
-        return Ok(PathBuf::from(path_str));
-      }
+  if let Ok(out) = output
+    && out.status.success()
+  {
+    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !path_str.is_empty() {
+      return Ok(PathBuf::from(path_str));
     }
   }
   // Fallback: locate the .git directory using `git rev-parse --git-dir`.
   let output = Command::new("git")
     .args(["rev-parse", "--git-dir"])
     .output();
-  if let Ok(out) = output {
-    if out.status.success() {
-      let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-      let hooks = PathBuf::from(git_dir).join("hooks");
-      return Ok(hooks);
-    }
+  if let Ok(out) = output
+    && out.status.success()
+  {
+    let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let hooks = PathBuf::from(git_dir).join("hooks");
+    return Ok(hooks);
   }
   Err(InstallError::HooksDir(
     "unable to determine git hooks directory".into(),
