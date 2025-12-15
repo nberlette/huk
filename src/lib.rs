@@ -1,3 +1,6 @@
+#![feature(associated_type_defaults)]
+#![feature(trait_alias)]
+
 //! Public library API for the `huk` crate.
 //!
 //! Although `huk` is primarily intended to be used as a CLI application,
@@ -6,12 +9,24 @@
 //! mirror those used by the CLI: configuration parsing, task definitions and
 //! execution logic.
 
-mod cli;
+pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod install;
 pub mod runner;
 pub mod task;
-mod tui;
+pub mod tui;
+
+#[macro_use]
+pub(crate) mod macros;
+
+pub(crate) mod handlers {
+  pub use crate::install::*;
+  pub use crate::runner::*;
+  pub use crate::tui::*;
+}
 
 pub use constants::*;
+
+#[cfg(test)]
+mod tests;

@@ -13,52 +13,18 @@ mod install;
 mod runner;
 mod task;
 mod tui;
+#[macro_use]
+mod macros;
 
-use clap::Parser;
-use cli::Cli;
-use cli::Commands;
-use std::process;
-
+pub use cli::*;
 pub use constants::*;
 
-#[derive(Debug, thiserror::Error)]
-pub enum HukError {
-  /// Wrapper around runner errors.
-  #[error(transparent)]
-  Runner(#[from] runner::RunnerError),
-
-  /// Wrapper around installation errors.
-  #[error(transparent)]
-  Install(#[from] install::InstallError),
-
-  #[error(transparent)]
-  Parse(#[from] task::TaskSpecParseError),
-
-  #[error(transparent)]
-  Config(#[from] config::ConfigError),
+fn main() {
+  Cli::run();
 }
 
-fn main() {
-  // Parse command line arguments using clap.
-  let cli = Cli::parse();
-
-  // Dispatch the requested subcommand.
-  let result: Result<(), HukError> = match &cli.command {
-    Commands::Install(opts) => {
-      install::handle_install(opts).map_err(|e| e.into())
-    }
-    Commands::List(opts) => runner::handle_list(opts).map_err(|e| e.into()),
-    Commands::Run(opts) => runner::handle_run(opts).map_err(|e| e.into()),
-    Commands::Tasks(opts) => runner::handle_tasks(opts).map_err(|e| e.into()),
-    Commands::Dashboard(_opts) => tui::handle_dashboard().map_err(|e| e.into()),
-    Commands::Add(opts) => runner::handle_add(opts).map_err(|e| e.into()),
-    Commands::Remove(opts) => runner::handle_remove(opts).map_err(|e| e.into()),
-    Commands::Update(opts) => runner::handle_update(opts).map_err(|e| e.into()),
-  };
-
-  // Exit with the appropriate code on error.
-  if let Err(err) = result {
-    eprintln!("error: {err}");
-    process::exit(1);
-  }
+pub(crate) mod handlers {
+  pub use crate::install::*;
+  pub use crate::runner::*;
+  pub use crate::tui::*;
 }
