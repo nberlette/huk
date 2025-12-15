@@ -8,13 +8,21 @@
 //! of those two forms.
 
 use core::any::type_name_of_val;
+use core::str::FromStr;
 
+use derive_more::with_trait::Debug;
+use derive_more::with_trait::Display;
+use derive_more::with_trait::From;
+use derive_more::with_trait::IsVariant;
+use derive_more::with_trait::TryFrom;
 use serde_json::Value;
 use thiserror::Error;
-use derive_more::with_trait::{Display, Debug, IsVariant, From};
+
+use crate::runner::RunnerError;
 
 /// Parsed representation of a task specification.
-#[derive(Debug, Display, Clone, PartialEq, Eq, IsVariant, From)]
+#[derive(Display, Clone, PartialEq, Eq, IsVariant, From, TryFrom)]
+#[try_from(repr)]
 pub enum TaskSpec {
   /// A bare string representing a script or command to execute.
   #[display("{_0}")]
@@ -42,6 +50,52 @@ pub enum TaskSpec {
     }).collect::<Vec<_>>().join("\n")
   })]
   Sequence(Vec<TaskSpec>),
+}
+
+impl std::fmt::Debug for TaskSpec {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{self}")
+  }
+}
+
+impl TaskSpec {
+  /// Convert the task specification back into a JSON value. This is used when
+  /// writing updates back to the configuration file.
+  pub fn to_json(&self) -> Value {
+    match self {
+      TaskSpec::Single(s) => Value::String(s.clone()),
+      TaskSpec::Detailed {
+        command,
+        description,
+        dependencies,
+      } => {
+        let mut map = serde_json::Map::new();
+        if let Some(cmd) = command {
+          map.insert("command".into(), Value::String(cmd.clone()));
+        }
+        if let Some(desc) = description {
+          map.insert("description".into(), Value::String(desc.clone()));
+        }
+        if !dependencies.is_empty() {
+          let deps = dependencies.iter().cloned().map(Value::String).collect();
+          map.insert("dependencies".into(), Value::Array(deps));
+        }
+        Value::Object(map)
+      }
+      TaskSpec::Sequence(list) => {
+        let seq = list.iter().map(TaskSpec::to_json).collect();
+        Value::Array(seq)
+      }
+    }
+  }
+
+  pub fn to_string(&self) -> String {
+    serde_json::to_string(&self.to_json()).unwrap_or_default()
+  }
+
+  pub fn to_string_pretty(&self) -> String {
+    serde_json::to_string_pretty(&self.to_json()).unwrap_or_default()
+  }
 }
 
 /// Errors that may occur while parsing a task specification from JSON.
@@ -106,5 +160,55 @@ impl TaskSpec {
         type_name_of_val(&other).to_string(),
       )),
     }
+  }
+}
+
+impl From<&TaskSpec> for Value {
+  #[inline(always)]
+  fn from(spec: &TaskSpec) -> Self {
+    spec.to_json()
+  }
+}
+
+impl From<TaskSpec> for Value {
+  #[inline(always)]
+  fn from(spec: TaskSpec) -> Self {
+    spec.to_json()
+  }
+}
+
+impl From<&Value> for TaskSpec {
+  #[inline(always)]
+  fn from(value: &Value) -> Self {
+    TaskSpec::from_json(value).expect("invalid task spec")
+  }
+}
+
+impl From<Value> for TaskSpec {
+  #[inline(always)]
+  fn from(value: Value) -> Self {
+    TaskSpec::from_json(&value).expect("invalid task spec")
+  }
+}
+
+impl FromStr for TaskSpec {
+  type Err = RunnerError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    let value: Value = serde_json::from_str(s).map_err(|_| {
+      TaskSpecParseError::InvalidType(
+        "could not parse string as JSON".to_string(),
+      )
+    })?;
+
+    TaskSpec::from_json(&value).map_err(Into::into)
+  }
+}
+
+impl TryFrom<&str> for TaskSpec {
+  type Error = RunnerError;
+
+  fn try_from(s: &str) -> Result<Self, Self::Error> {
+    s.parse()
   }
 }
