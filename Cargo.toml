@@ -3,7 +3,7 @@ name = "huk"
 version = "0.1.0"
 edition = "2024"
 authors = ["Nicholas Berlette <nick@berlette.com>"]
-description = "Lightweight utility for integrating git hooks with the scripts/tasks from your project's package.json/deno.json file."
+description = "Integrated git hooks with package.json and deno.json tasks."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/nberlette/huk"
@@ -16,13 +16,19 @@ categories = [
 ]
 
 [lib]
-name       = "huk"
-path       = "src/lib.rs"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["cdylib"]
 
 [[bin]]
 name = "huk"
-path = "src/main.rs"
+
+[features]
+default = ["tui"]
+cargo_toml_config = []
+custom_config = []
+tui = ["ratatui", "crossterm", "chrono"]
+ratatui = ["dep:ratatui"]
+crossterm = ["dep:crossterm"]
+chrono = ["dep:chrono"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive", "rc", "alloc"] }
@@ -36,14 +42,14 @@ clap = { version = "4.4", features = ["derive"] }
 thiserror = "2.0"
 regex = "1.12"
 which = "8.0"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = [], optional = true }
 ratatui = { version = "0.29", features = [
   "crossterm",
   "serde",
   "all-widgets",
   "scrolling-regions",
   "palette",
-] }
+], optional = true }
 directories = "6.0"
 lazy_static = "1.4"
 derive_more = { version = "2.1", features = [
@@ -55,15 +61,26 @@ derive_more = { version = "2.1", features = [
   "deref",
   "deref_mut",
   "from",
+  "into",
+  "try_from",
+  "try_into",
   "unwrap",
+  "try_unwrap",
+  "from_str",
+  "into_iterator",
+  "index",
+  "index_mut",
 ] }
 moos = "0.1.0"
+toml = { version = "0.9.8", features = ["preserve_order"] }
+paste = { version = "0.2.0", package = "pastey" }
+chrono = { version = "0.4.42", optional = true }
 
 [dev-dependencies]
-tempfile   = "3.23"
+tempfile = "3.23"
 assert_cmd = "2.0"
 
 [profile.release]
-opt-level     = "z"
-lto           = true
+opt-level = "z"
+lto = true
 codegen-units = 1
