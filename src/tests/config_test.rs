@@ -1,10 +1,9 @@
-use huk::config::ConfigSource;
-use huk::config::HookConfig;
-use huk::task::TaskSpec;
-use huk::task::TaskSpecParseError;
+use crate::config::ConfigSource;
+use crate::config::HookConfig;
+use crate::task::TaskSpec;
+use crate::task::TaskSpecParseError;
 use serde_json::json;
 use std::fs;
-use std::path::Path;
 use tempfile::tempdir;
 
 #[test]
@@ -96,4 +95,38 @@ fn discover_package_json() {
   }
   assert_eq!(cfg.package_manager.as_deref(), Some("pnpm@9.1.4"));
   assert!(cfg.node_scripts.contains_key("lint"));
+}
+
+use crate::config::strip_json_comments;
+
+#[test]
+fn preserves_urls_and_strings_with_slashes() {
+  let input = r#"
+    {
+      "author": { "url": "https://berlette.com/path" },
+      "note": "keep // inside string",
+      // line comment
+      "value": "/* not a comment */"
+    }
+    "#;
+
+  let cleaned = strip_json_comments(input);
+  let parsed: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+  assert_eq!(
+    parsed,
+    json!({
+      "author": { "url": "https://berlette.com/path" },
+      "note": "keep // inside string",
+      "value": "/* not a comment */"
+    })
+  );
+}
+
+#[test]
+fn removes_comments_and_preserves_newlines() {
+  let input = "{\n// comment 1\n\"a\": 1,\n/* multi\nline */\n\"b\": 2\n}\n";
+  let cleaned = strip_json_comments(input);
+  assert_eq!(cleaned.lines().count(), input.lines().count());
+  let parsed: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+  assert_eq!(parsed, json!({ "a": 1, "b": 2 }));
 }
