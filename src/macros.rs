@@ -14,6 +14,9 @@ macro_rules! file_name {
 #[macro_export]
 macro_rules! print_tasks {
   ($cfg:expr) => {
+    $crate::print_tasks!($cfg, compact = false);
+  };
+  ($cfg:expr,compact = $compact:expr) => {
     let (kind, source, path) = match $cfg.source {
       $crate::config::ConfigSource::DenoJson(ref path) => {
         ("task", $crate::file_name!(path), path)
@@ -55,20 +58,26 @@ macro_rules! print_tasks {
           "<unknown>"
         };
         let named = (*name).clone();
-        let name = format!(
-          r#"{cyan}{named}{reset}"#,
-          cyan = "\x1b[1;36m",
-          reset = "\x1b[0m"
-        );
         let cmd = cmd.replace('\n', " ");
-        let src = format!(
-          r#"{italic}{gray}({source}){reset}"#,
-          italic = "\x1b[3m",
-          gray = "\x1b[90m",
-          reset = "\x1b[0m"
-        );
-        eprintln!(r#"- {name} {src}"#);
-        eprintln!(r#"  {cmd}"#);
+        if $compact {
+          let src = format!("({source})");
+          eprintln!(r#"- {named} {src}"#);
+          eprintln!(r#"  {cmd}"#);
+        } else {
+          let name = format!(
+            r#"{cyan}{named}{reset}"#,
+            cyan = "\x1b[1;36m",
+            reset = "\x1b[0m"
+          );
+          let src = format!(
+            r#"{italic}{gray}({source}){reset}"#,
+            italic = "\x1b[3m",
+            gray = "\x1b[90m",
+            reset = "\x1b[0m"
+          );
+          eprintln!(r#"- {name} {src}"#);
+          eprintln!(r#"  {cmd}"#);
+        }
 
         n -= 1;
       }
