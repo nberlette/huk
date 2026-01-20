@@ -51,11 +51,11 @@ macro_rules! print_tasks {
       while n > 0 {
         let name = &all_tasks[all_tasks.len() - n];
         let cmd = if let Some(script) = $cfg.node_scripts.get(*name) {
-          script
-        } else if let Some(script) = $cfg.deno_tasks.get(*name) {
-          script
+          script.to_string()
+        } else if let Some(task) = $cfg.deno_tasks.get(*name) {
+          task.command_string()
         } else {
-          "<unknown>"
+          "<unknown>".into()
         };
         let named = (*name).clone();
         let cmd = cmd.replace('\n', " ");

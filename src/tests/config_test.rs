@@ -1,7 +1,9 @@
+use crate::config::ConfigError;
 use crate::config::ConfigSource;
 use crate::config::HookConfig;
 use crate::task::TaskSpec;
 use crate::task::TaskSpecParseError;
+use moos::CowStr;
 use serde_json::json;
 use std::fs;
 use tempfile::tempdir;
@@ -10,7 +12,7 @@ use tempfile::tempdir;
 fn parse_task_spec_string() {
   let v = json!("npm test");
   let spec = TaskSpec::from_json(&v).unwrap();
-  assert_eq!(spec, TaskSpec::Single("npm test".into()));
+  assert_eq!(spec, TaskSpec::Single(CowStr::from("npm test")));
 }
 
 #[test]
@@ -23,8 +25,8 @@ fn parse_task_spec_object_with_command() {
       description,
       dependencies,
     } => {
-      assert_eq!(command, Some("deno fmt".into()));
-      assert_eq!(description, Some("Format code".into()));
+      assert_eq!(command, Some(CowStr::from("deno fmt")));
+      assert_eq!(description, Some(CowStr::from("Format code")));
       assert!(dependencies.is_empty());
     }
     _ => panic!("unexpected variant"),
@@ -74,6 +76,59 @@ fn discover_deno_json() {
 }
 
 #[test]
+fn discover_deno_json_task_objects() {
+  let dir = tempdir().unwrap();
+  let deno_path = dir.path().join("deno.json");
+  fs::write(
+    &deno_path,
+    r#"{
+        "hooks": {"pre-commit": "fmt"},
+        "tasks": {
+          "check": "deno check **/*.ts",
+          "fmt": {"command": "deno fmt", "description": "Format", "dependencies": ["check"]}
+        }
+    }"#,
+  )
+  .unwrap();
+  let cfg = HookConfig::discover(dir.path()).unwrap();
+  match cfg.deno_tasks.get("fmt") {
+    Some(TaskSpec::Detailed {
+      command,
+      description,
+      dependencies,
+    }) => {
+      assert_eq!(*command, Some(CowStr::from("deno fmt")));
+      assert_eq!(*description, Some(CowStr::from("Format")));
+      assert_eq!(dependencies, &vec![CowStr::from("check")]);
+    }
+    _ => panic!("expected detailed task spec"),
+  }
+}
+
+#[test]
+fn deno_task_dependencies_must_exist() {
+  let dir = tempdir().unwrap();
+  let deno_path = dir.path().join("deno.json");
+  fs::write(
+    &deno_path,
+    r#"{
+        "hooks": {"pre-commit": "lint"},
+        "tasks": {
+          "lint": {"dependencies": ["missing"]}
+        }
+    }"#,
+  )
+  .unwrap();
+  let err = HookConfig::discover(dir.path()).unwrap_err();
+  match err {
+    ConfigError::InvalidTask(name, _) => {
+      assert_eq!(name, "lint");
+    }
+    _ => panic!("expected invalid task error"),
+  }
+}
+
+#[test]
 fn discover_package_json() {
   let dir = tempdir().unwrap();
   let pkg_path = dir.path().join("package.json");
@@ -95,6 +150,90 @@ fn discover_package_json() {
   }
   assert_eq!(cfg.package_manager.as_deref(), Some("pnpm@9.1.4"));
   assert!(cfg.node_scripts.contains_key("lint"));
+}
+
+#[test]
+fn discover_prefers_package_json_when_deno_has_no_hooks() {
+  let dir = tempdir().unwrap();
+  let deno_path = dir.path().join("deno.json");
+  let pkg_path = dir.path().join("package.json");
+  fs::write(
+    &deno_path,
+    r#"{
+        "tasks": {"fmt": "deno fmt"}
+    }"#,
+  )
+  .unwrap();
+  fs::write(
+    &pkg_path,
+    r#"{
+        "hooks": {"pre-commit": "lint"},
+        "scripts": {"lint": "eslint ."}
+    }"#,
+  )
+  .unwrap();
+  let cfg = HookConfig::discover(dir.path()).unwrap();
+  match cfg.source {
+    ConfigSource::PackageJson(ref path) => {
+      assert_eq!(path.as_path(), pkg_path.as_path())
+    }
+    _ => panic!("expected PackageJson"),
+  }
+}
+
+#[test]
+fn discover_prefers_deno_json_when_hooks_present() {
+  let dir = tempdir().unwrap();
+  let deno_path = dir.path().join("deno.json");
+  let pkg_path = dir.path().join("package.json");
+  fs::write(
+    &deno_path,
+    r#"{
+        "hooks": {"pre-commit": "fmt"},
+        "tasks": {"fmt": "deno fmt"}
+    }"#,
+  )
+  .unwrap();
+  fs::write(
+    &pkg_path,
+    r#"{
+        "hooks": {"pre-commit": "lint"},
+        "scripts": {"lint": "eslint ."}
+    }"#,
+  )
+  .unwrap();
+  let cfg = HookConfig::discover(dir.path()).unwrap();
+  match cfg.source {
+    ConfigSource::DenoJson(ref path) => {
+      assert_eq!(path.as_path(), deno_path.as_path())
+    }
+    _ => panic!("expected DenoJson"),
+  }
+}
+
+#[test]
+fn deno_task_dependencies_must_be_array() {
+  let dir = tempdir().unwrap();
+  let deno_path = dir.path().join("deno.json");
+  fs::write(
+    &deno_path,
+    r#"{
+        "hooks": {"pre-commit": "lint"},
+        "tasks": {
+          "lint": {"dependencies": "fmt"},
+          "fmt": "deno fmt"
+        }
+    }"#,
+  )
+  .unwrap();
+  let err = HookConfig::discover(dir.path()).unwrap_err();
+  match err {
+    ConfigError::InvalidTask(name, message) => {
+      assert_eq!(name, "lint");
+      assert!(message.contains("dependencies must be an array of strings"));
+    }
+    _ => panic!("expected invalid task error"),
+  }
 }
 
 use crate::config::strip_json_comments;

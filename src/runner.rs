@@ -10,11 +10,11 @@ use std::io;
 use std::process::Command;
 use std::process::ExitStatus;
 
-use ::derive_more::IsVariant;
-use ::serde_json::json;
+use derive_more::IsVariant;
 use moos::CowStr;
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::json;
 use thiserror::Error;
 
 use crate::GIT_HOOKS;
@@ -105,7 +105,7 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
         (Name(a), Name(b)) => a.cmp(b),
         // so we can safely discard all other cases
         (_, _) => std::cmp::Ordering::Equal,
-      })
+      });
     } else {
       hooks = hooks_sorted
         .iter()
@@ -114,7 +114,7 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
           spec: if opts.name_only {
             None
           } else {
-            Some(spec.to_json())
+            Some(spec.to_json_value())
           },
         })
         .collect();
@@ -178,12 +178,11 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
     eprintln!("Discovered {n} hook{s} in '{path}':");
     eprintln!();
   }
-  let mut i = 0;
-  for (hook, spec) in hooks_sorted {
-    if i != 0 && !opts.all && !opts.compact && !opts.name_only {
+
+  for (i, (hook, spec)) in hooks_sorted.iter().enumerate() {
+    if i > 0 && !opts.all && !opts.compact && !opts.name_only {
       eprintln!();
     }
-    i += 1;
     if opts.name_only || opts.all {
       println!("- {hook}");
       continue;
@@ -230,14 +229,13 @@ pub fn handle_list(opts: &ListOpts) -> Result<(), RunnerError> {
           let info = if cfg.node_scripts.contains_key(&rest)
             || cfg.deno_tasks.contains_key(&rest)
           {
-            let (_kind, cmd): (CowStr, CowStr) =
-              if let Some(script) = cfg.node_scripts.get(&rest) {
-                (CowStr::from("script"), CowStr::from(script.as_str()))
-              } else if let Some(script) = cfg.deno_tasks.get(&rest) {
-                (CowStr::from("task"), CowStr::from(script.as_str()))
-              } else {
-                (CowStr::from("unknown"), "<unknown>".into())
-              };
+            let cmd = if let Some(script) = cfg.node_scripts.get(&rest) {
+              script.to_string()
+            } else if let Some(task) = cfg.deno_tasks.get(&rest) {
+              task.command_string()
+            } else {
+              "<unknown>".into()
+            };
             let named = rest.clone();
             let cmd = cmd.replace('\n', " ");
             format!(
@@ -332,14 +330,14 @@ pub fn handle_task(opts: &TaskOpts) -> Result<(), RunnerError> {
       .iter()
       .map(|(name, cmd)| TaskEntry {
         name:    name.clone(),
-        command: cmd.clone(),
+        command: cmd.command_string(),
         kind:    "task".into(),
       })
       .collect();
 
     tasks.extend(cfg.node_scripts.iter().map(|(name, cmd)| TaskEntry {
       name:    name.clone(),
-      command: cmd.clone(),
+      command: cmd.to_string(),
       kind:    "script".into(),
     }));
 
@@ -413,7 +411,7 @@ pub fn handle_add(opts: &AddOpts) -> Result<(), RunnerError> {
   let merged = merge_specs(cfg.hooks.get(&opts.hook), spec, opts.replace);
 
   mutate_hooks(&cfg, |hooks| {
-    hooks.insert(opts.hook.clone(), merged.to_json());
+    hooks.insert(opts.hook.clone(), merged.to_json_value());
     Ok(())
   })?;
 
@@ -462,17 +460,20 @@ pub fn handle_remove(opts: &RemoveOpts) -> Result<(), RunnerError> {
   mutate_hooks(&cfg, |hooks| {
     if let Some(task_str) = &opts.task {
       let target = parse_spec_input(task_str)?;
+
       if let Some(current) = hooks.get(&opts.hook).cloned() {
         let parsed_current = TaskSpec::from_json(&current)
           .map_err(RunnerError::InvalidTaskSpec)?;
+
         if let Some(next_spec) = remove_task_from_spec(&parsed_current, &target)
         {
-          hooks.insert(opts.hook.clone(), next_spec.to_json());
+          hooks.insert(opts.hook.clone(), next_spec.to_json_value());
         } else {
           hooks.remove(&opts.hook);
         }
         removed = true;
       }
+
       Ok(())
     } else {
       hooks.remove(&opts.hook);
@@ -494,6 +495,7 @@ pub fn handle_remove(opts: &RemoveOpts) -> Result<(), RunnerError> {
   } else if !opts.force {
     eprintln!("Task not found in hook '{}'; no changes made.", opts.hook);
   }
+
   Ok(())
 }
 
@@ -501,6 +503,7 @@ pub fn handle_remove(opts: &RemoveOpts) -> Result<(), RunnerError> {
 pub fn handle_update(opts: &UpdateOpts) -> Result<(), RunnerError> {
   let cfg = HookConfig::discover(&std::env::current_dir()?)?;
   ensure_valid_hook_name(&opts.hook)?;
+
   if !cfg.hooks.contains_key(&opts.hook) {
     eprintln!(
       "Hook '{}' is not currently defined in {}. Use `huk add` to create it.",
@@ -511,13 +514,16 @@ pub fn handle_update(opts: &UpdateOpts) -> Result<(), RunnerError> {
   }
 
   let spec = parse_specs_inputs(&opts.spec)?;
+
   let merged = merge_specs(cfg.hooks.get(&opts.hook), spec, opts.replace);
+
   mutate_hooks(&cfg, |hooks| {
-    hooks.insert(opts.hook.clone(), merged.to_json());
+    hooks.insert(opts.hook.clone(), merged.to_json_value());
     Ok(())
   })?;
 
   let verb = if opts.replace { "Replaced" } else { "Updated" };
+
   eprintln!("{verb} hook '{}' in {}.", opts.hook, cfg.source.as_str());
   Ok(())
 }
@@ -562,7 +568,7 @@ impl<'cfg> TaskRunner<'cfg> {
     extra_args: &[String],
   ) -> Result<(), RunnerError> {
     match spec {
-      TaskSpec::Single(name) => self.run_single(name, extra_args),
+      TaskSpec::Single(name) => self.run_single(name.as_ref(), extra_args),
       TaskSpec::Detailed {
         command,
         dependencies,
@@ -570,10 +576,11 @@ impl<'cfg> TaskRunner<'cfg> {
       } => {
         // Execute dependencies first.
         for dep in dependencies {
-          self.run_named_task(dep)?;
+          self.run_named_task(dep.as_ref())?;
         }
+
         if let Some(cmd) = command {
-          self.exec_raw_command(cmd, extra_args)
+          self.exec_raw_command(cmd.as_ref(), extra_args)
         } else {
           // Only dependencies defined; nothing else to do.
           Ok(())
@@ -594,25 +601,22 @@ impl<'cfg> TaskRunner<'cfg> {
     name: &str,
     extra_args: &[String],
   ) -> Result<(), RunnerError> {
-    // To avoid cycles, track the task names we are resolving.
     if self.visiting.contains(name) {
       return Err(RunnerError::CircularDependency(name.to_string()));
     }
     self.visiting.insert(name.to_string());
     let result = if self.config.deno_tasks.get(name).is_some() {
-      // It's a Deno task.
       self.exec_deno_task(name, extra_args)
     } else if let Some(script) = self.config.node_scripts.get(name) {
-      // It's a Node script.
       self.exec_node_script(name, script, extra_args)
     } else if let Some(spec) = self.config.hooks.get(name) {
-      // It's another hook; run its spec.
       self.run_spec(spec, name, extra_args)
     } else {
-      // Unknown: treat as raw command.
       self.exec_raw_command(name, extra_args)
     };
+
     self.visiting.remove(name);
+
     result
   }
 
@@ -631,24 +635,32 @@ impl<'cfg> TaskRunner<'cfg> {
     cmd: &str,
     extra_args: &[String],
   ) -> Result<(), RunnerError> {
-    // Compose the final command string. If there are extra args, append them.
     let mut full_cmd = cmd.to_string();
+
     if !extra_args.is_empty() {
-      // Append each argument quoting as necessary (naive quoting: wrap in
-      // single quotes if whitespace).
       for arg in extra_args {
+        full_cmd.push(' ');
+
         if arg.contains(' ') {
-          full_cmd.push(' ');
-          full_cmd.push_str(&format!("'{}'", arg.replace('"', "\\\"")));
+          let arg = arg.replace('\'', "\\\'").replace('"', "'\"'");
+          full_cmd.push_str(&format!("'{arg}'"));
         } else {
-          full_cmd.push(' ');
           full_cmd.push_str(arg);
         }
       }
     }
-    // Execute via sh -c.
+
+    // todo: fix this and correctly implement windows support throughout the
+    // rest of the crate.
+    #[cfg(target_os = "windows")]
+    let mut command: Command = Command::new("pwsh.exe");
+
+    #[cfg(not(target_os = "windows"))]
+    // todo: 'sh' should not be hardcoded here. the shell/program used as a
+    // runner should be configurable
     let mut command = Command::new("sh");
     command.arg("-c").arg(&full_cmd);
+
     self.spawn_command(command, full_cmd)
   }
 
@@ -660,9 +672,11 @@ impl<'cfg> TaskRunner<'cfg> {
   ) -> Result<(), RunnerError> {
     let mut cmd = Command::new("deno");
     cmd.arg("task").arg(name);
+
     for arg in extra_args {
       cmd.arg(arg);
     }
+
     self.spawn_command(cmd, format!("deno task {name}"))
   }
 
@@ -670,16 +684,17 @@ impl<'cfg> TaskRunner<'cfg> {
   pub(crate) fn exec_node_script(
     &mut self,
     name: &str,
-    _script: &str,
+    _script: &CowStr<'static>,
     extra_args: &[String],
   ) -> Result<(), RunnerError> {
-    // Determine the package manager. Parse something like "pnpm@7.1.2" into
-    // "pnpm".
+    // Determine the package manager. Parses e.g. "pnpm@7.1.2" into "pnpm"
     let manager = self.config.package_manager.as_deref().unwrap_or("npm");
     let exe_name = Self::extract_package_manager_command(manager);
+
     // Build the command: <pm> run <script> [-- <extra args>]
     let mut cmd = Command::new(&exe_name);
     cmd.arg("run").arg(name);
+
     // If there are extra arguments, insert -- to forward them to the script.
     if !extra_args.is_empty() {
       cmd.arg("--");
@@ -687,6 +702,7 @@ impl<'cfg> TaskRunner<'cfg> {
         cmd.arg(arg);
       }
     }
+
     self.spawn_command(cmd, format!("{exe_name} run {name}"))
   }
 
@@ -713,14 +729,22 @@ impl<'cfg> TaskRunner<'cfg> {
   ) -> Result<(), RunnerError> {
     if let Some(buf) = self.output.as_mut() {
       let output = cmd.output()?;
+
       if !output.stdout.is_empty() {
         buf.push(OutputChunk::Stdout(
-          String::from_utf8_lossy(&output.stdout).to_string(),
+          String::from_utf8_lossy(unsafe {
+            ::core::mem::transmute_copy(&output.stdout)
+          })
+          .into(),
         ));
       }
+
       if !output.stderr.is_empty() {
         buf.push(OutputChunk::Stderr(
-          String::from_utf8_lossy(&output.stderr).to_string(),
+          String::from_utf8_lossy(unsafe {
+            ::core::mem::transmute_copy(&output.stderr)
+          })
+          .into(),
         ));
       }
       if output.status.success() {
@@ -748,6 +772,6 @@ impl<'cfg> TaskRunner<'cfg> {
 /// Captured output from a task execution, used primarily by the TUI dashboard.
 #[derive(Clone, Debug)]
 pub enum OutputChunk {
-  Stdout(String),
-  Stderr(String),
+  Stdout(CowStr<'static>),
+  Stderr(CowStr<'static>),
 }
