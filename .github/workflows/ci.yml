@@ -1,0 +1,136 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+    tags: ["*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      lint:
+        description: |
+          Lint code with clippy?
+        type: boolean
+        required: false
+        default: true
+      fmt:
+        description: |
+          Run cargo fmt --check?
+        type: boolean
+        required: false
+        default: true
+      test:
+        description: |
+          Run cargo test?
+        type: boolean
+        required: false
+        default: true
+      publish:
+        description: |
+          Publish to crates.io?
+        type: boolean
+        required: false
+        default: true
+      build:
+        description: |
+          Build binary artifact(s) for release?
+        type: boolean
+        required: false
+        default: true
+      target:
+        description: |
+          Build target triple (arch-vendor-os[-env])
+        type: choice
+        required: false
+        default: 'x86_64-unknown-linux-gnu'
+        options:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - x86_64-pc-windows-msvc
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - aarch64-pc-windows-msvc
+          - other
+      targets:
+        description: |
+          Custom build targets (comma separated):
+        type: string
+        required: false
+        default: 'x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-apple-darwin,x86_64-pc-windows-msvc,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl,aarch64-apple-darwin,aarch64-pc-windows-msvc'
+      release:
+        description: |
+          Create a new GitHub Release?
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      issues: read
+      discussions: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dsherret/rust-toolchain-file@v1
+
+      - id: lint
+        if: inputs.lint != 'false'
+        run: cargo clippy --all
+
+      - id: fmt
+        if: inputs.fmt != 'false'
+        run: cargo fmt --all -- --check
+
+      - id: test
+        if: inputs.test != 'false'
+        run: cargo test --all
+
+      - id: publish
+        if: |
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+        run: cargo publish --dry-run && cargo publish
+
+      - id: build
+        if: |
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.build == 'true')
+        env:
+          TARGET: ${{ (inputs.target == 'other' && inputs.targets) || inputs.target }}
+          RUST_BACKTRACE: ${{ (runner.debug && 'full') || '1' }}
+        run: |
+          # shellcheck disable=SC2086,SC2206
+          TARGETS=(${TARGET//[ ,]/$'\n'})
+          for target in "${TARGETS[@]}"; do
+            echo $'\e[1;32mBUILDING\e[0m for target \e[1;36m'"${target}"$'\e[0m'
+            echo $'\e[2m'"$(printf '%66s' '-' | tr ' ' '-')"$'\e[22m\n'
+            rustup target add "$target"
+            if cargo build --bin huk --release --target "$target" --artifact-dir "bin/${target}" -Zunstable-options 2>&1; then
+              cp LICENSE README.md "bin/${target}"
+              tar -caf "../huk-${GITHUB_REF_NAME}_${target}.tar.gz" -C "bin/${target}" --exclude-vcs-ignores .
+            fi
+          done
+
+      - id: artifacts
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          path: bin/*.tar.gz
+          name: huk-${{ github.ref_name }}-${{ github.sha }}
+
+      - id: release
+        if: |
+          steps.build.outcome == 'success' && (
+            (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+            (github.event_name == 'workflow_dispatch' && inputs.release != 'false')
+          )
+        run: |
+          # shellcheck disable=SC2086
+          gh release create --title "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" --generate-notes --discussion-category Announcements -- bin/*.tar.gz
