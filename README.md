@@ -14,7 +14,7 @@ just before committing (`pre‑commit`), when preparing a commit message
 (`prepare‑commit‑msg`) or before pushing (`pre‑push`). Git’s documentation
 describes a rich set of client‑side hooks, including `pre‑commit`,
 `prepare‑commit‑msg`, `commit‑msg`, `post‑commit`, `pre‑rebase` and
-`pre‑push`【23307213681274†L240-L330】. Setting up and distributing these
+`pre‑push`. Setting up and distributing these
 scripts across multiple environments can be cumbersome. hük centralizes hook
 definitions alongside your project’s existing task configuration, making it
 simple to install and manage them.
@@ -24,7 +24,7 @@ If your project targets Node.js you can also specify a `packageManager` field in
 `npm@x.y.z`, `pnpm@x.y.z` and `yarn@x.y.z`. The
 [Corepack](https://nodejs.org/docs/latest/api/cli.html#corepack) tool uses this
 field to download and select the appropriate package manager; hük respects it
-and falls back to `npm` when unspecified【349948098167533†L48-L59】.
+and falls back to `npm` when unspecified.
 
 ## Installation
 
@@ -63,7 +63,7 @@ Tasks can refer to:
 
 If both a `deno.json` and a `package.json` are present, hük prefers the
 `deno.json` and falls back to `package.json`. When executing Node scripts hük
-honours the `packageManager` field if present【349948098167533†L48-L59】.
+honours the `packageManager` field if present.
 
 ### Example (Deno)
 
@@ -100,7 +100,7 @@ honours the `packageManager` field if present【349948098167533†L48-L59】.
       "lint",
       { "command": "npm run test", "description": "Run tests" }
     ],
-    "commit-msg": { "command": "echo Validate commit message" }
+    "commit-msg": "npx git-cz",
   }
 }
 ```
