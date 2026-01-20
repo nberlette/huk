@@ -31,6 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
+use ratatui::layout::Rect;
 use ratatui::prelude::Stylize;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -43,6 +44,7 @@ use ratatui::widgets::BorderType;
 use ratatui::widgets::Borders;
 use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
+use ratatui::widgets::ListState;
 use ratatui::widgets::Padding;
 use ratatui::widgets::Paragraph;
 use serde_json::Map;
@@ -60,6 +62,10 @@ use crate::task::TaskSpec;
 const LOG_LIMIT: usize = 2000;
 const BASE_SCROLL_DELTA: usize = 2;
 const FAST_SCROLL_MULTIPLIER: usize = 3;
+const MIN_TWO_COLUMN_WIDTH: u16 = 88;
+const MIN_PANEL_HEIGHT: u16 = 8;
+const MIN_LIST_HEIGHT: u16 = 6;
+const MIN_DETAIL_HEIGHT: u16 = 5;
 
 macro_rules! match_common_input {
   ($state:expr, $prompt:expr, $code:expr) => {{
@@ -167,8 +173,7 @@ fn wrap_text_lines(text: &str, width: u16) -> Vec<String> {
 }
 
 fn format_spec(spec: &TaskSpec) -> String {
-  serde_json::to_string(&spec.to_json_value())
-    .unwrap_or_else(|_| spec.to_json())
+  spec.to_json_pretty()
 }
 
 fn editable_spec(spec: &TaskSpec) -> String {
@@ -210,6 +215,110 @@ impl Focus {
   }
 }
 
+#[derive(Clone, Copy)]
+pub enum SpecEditMode {
+  Add,
+  Update,
+}
+
+fn task_source_label(cfg: &HookConfig) -> String {
+  match (cfg.deno_tasks.len(), cfg.node_scripts.len()) {
+    (0, 0) | (_, 0) => "Tasks".to_string(),
+    (0, _) => "Scripts".to_string(),
+    (_, _) => "Tasks & Scripts".to_string(),
+  }
+}
+
+fn split_list_detail(area: Rect) -> (Rect, Rect) {
+  let min_total = MIN_LIST_HEIGHT.saturating_add(MIN_DETAIL_HEIGHT);
+  let mut list_height =
+    ((area.height as f32) * 0.35).round() as u16;
+
+  if area.height <= min_total {
+    list_height = area.height / 2;
+  } else {
+    list_height = list_height
+      .max(MIN_LIST_HEIGHT)
+      .min(area.height.saturating_sub(MIN_DETAIL_HEIGHT));
+  }
+
+  let detail_height = area.height.saturating_sub(list_height);
+  let list_rect = Rect {
+    x: area.x,
+    y: area.y,
+    width: area.width,
+    height: list_height,
+  };
+  let detail_rect = Rect {
+    x: area.x,
+    y: area.y.saturating_add(list_height),
+    width: area.width,
+    height: detail_height,
+  };
+  (list_rect, detail_rect)
+}
+
+fn collect_available_hooks(current: &[(String, TaskSpec)]) -> Vec<String> {
+  let mut hooks: Vec<String> = crate::constants::GIT_HOOKS
+    .iter()
+    .filter(|name| !current.iter().any(|(h, _)| h == *name))
+    .map(|name| (*name).to_string())
+    .collect();
+  hooks.sort();
+  hooks
+}
+
+fn selected_tasks_from_spec(
+  spec: &TaskSpec,
+  tasks: &[(String, TaskSpec)],
+) -> Vec<usize> {
+  let mut selected = Vec::new();
+  match spec {
+    TaskSpec::Single(name) => {
+      if let Some((idx, _)) =
+        tasks.iter().enumerate().find(|(_, (n, _))| n == name.as_ref())
+      {
+        selected.push(idx);
+      }
+    }
+    TaskSpec::Sequence(list) => {
+      for item in list {
+        if let TaskSpec::Single(name) = item {
+          if let Some((idx, _)) =
+            tasks.iter().enumerate().find(|(_, (n, _))| n == name.as_ref())
+          {
+            if !selected.contains(&idx) {
+              selected.push(idx);
+            }
+          }
+        }
+      }
+    }
+    TaskSpec::Detailed { .. } => {}
+  }
+  selected.sort_unstable();
+  selected
+}
+
+fn task_spec_from_selection(
+  selections: &[usize],
+  tasks: &[(String, TaskSpec)],
+) -> Option<TaskSpec> {
+  let mut items: Vec<TaskSpec> = selections
+    .iter()
+    .filter_map(|idx| tasks.get(*idx))
+    .map(|(name, _)| TaskSpec::Single(CowStr::from(name.clone())))
+    .collect();
+
+  if items.is_empty() {
+    return None;
+  }
+  if items.len() == 1 {
+    return Some(items.remove(0));
+  }
+  Some(TaskSpec::Sequence(items))
+}
+
 /// Internal state for the dashboard.
 #[derive(Clone, Constructor)]
 pub struct DashboardState<'a> {
@@ -217,13 +326,17 @@ pub struct DashboardState<'a> {
   pub running: bool,
   pub hooks:   Vec<(String, TaskSpec)>,
   pub index:   usize,
-  pub tasks:   Vec<(CowStr<'a>, TaskSpec)>,
+  pub tasks:   Vec<(String, TaskSpec)>,
   pub task:    usize,
+  pub hook_state: ListState,
+  pub task_state: ListState,
   pub logs:    Vec<LogEntry>,
   pub prompt:  Option<Prompt>,
   pub focus:   Focus,
   pub scroll:  usize,
   pub source:  String,
+  pub task_label: String,
+  pub task_source: String,
 }
 
 impl<'a> Default for DashboardState<'a> {
@@ -235,11 +348,15 @@ impl<'a> Default for DashboardState<'a> {
       index:   0,
       tasks:   vec![],
       task:    0,
+      hook_state: ListState::default(),
+      task_state: ListState::default(),
       logs:    vec![],
       prompt:  None,
       focus:   Focus::Hooks,
       scroll:  0,
       source:  String::new(),
+      task_label: String::new(),
+      task_source: String::new(),
     }
   }
 }
@@ -252,13 +369,11 @@ where
 
   fn cwd(&self) -> &Path;
 
-  fn add_hook<T: TryInto<TaskSpec>>(
+  fn add_hook(
     &mut self,
     name: &str,
-    spec: T,
-  ) -> Result<(), RunnerError>
-  where
-    <T as TryInto<TaskSpec>>::Error: Into<RunnerError>;
+    spec: TaskSpec,
+  ) -> Result<(), RunnerError>;
 
   fn refresh_config(&mut self) -> Result<(), RunnerError>;
 
@@ -274,13 +389,11 @@ where
     args: &[String],
   ) -> Result<(), RunnerError>;
 
-  fn update_hook<T: TryInto<TaskSpec>>(
+  fn update_hook(
     &mut self,
     name: &str,
-    spec: T,
-  ) -> Result<(), RunnerError>
-  where
-    <T as TryInto<TaskSpec>>::Error: Into<RunnerError>;
+    spec: TaskSpec,
+  ) -> Result<(), RunnerError>;
 
   fn discover_config(&mut self) -> Result<HookConfig, RunnerError> {
     HookConfig::discover(self.cwd()).map_err(Into::into)
@@ -310,16 +423,12 @@ impl<'a> HookManager<'a> for DashboardState<'a> {
     })
   }
 
-  fn add_hook<T: TryInto<TaskSpec>>(
+  fn add_hook(
     &mut self,
     hook: &str,
-    spec: T,
-  ) -> Result<(), RunnerError>
-  where
-    <T as TryInto<TaskSpec>>::Error: Into<RunnerError>,
-  {
+    spec: TaskSpec,
+  ) -> Result<(), RunnerError> {
     ensure_valid_hook_name(hook)?;
-    let spec = spec.try_into().map_err(Into::into)?;
     self.mutate_hooks(|hooks| {
       hooks.insert(hook.to_string(), spec.to_json_value());
       Ok(())
@@ -341,15 +450,11 @@ impl<'a> HookManager<'a> for DashboardState<'a> {
     Ok(())
   }
 
-  fn update_hook<T: TryInto<TaskSpec>>(
+  fn update_hook(
     &mut self,
     hook: &str,
-    spec: T,
-  ) -> Result<(), RunnerError>
-  where
-    <T as TryInto<TaskSpec>>::Error: Into<RunnerError>,
-  {
-    let spec = spec.try_into().map_err(Into::into)?;
+    spec: TaskSpec,
+  ) -> Result<(), RunnerError> {
     let cfg = HookConfig::discover(self.cwd)?;
 
     mutate_hooks(&cfg, |hooks| {
@@ -524,13 +629,40 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                   self.set_prompt(prompt)?;
                 }
               }
-              Char('a') => self.set_prompt(Prompt::add_hook_name())?,
+              Char('a') => {
+                let options = collect_available_hooks(&self.hooks);
+                if options.is_empty() {
+                  self.push_log(
+                    LogLevel::Error,
+                    "All supported hooks are already configured.",
+                  );
+                } else {
+                  self.set_prompt(Prompt::pick_hook(options))?;
+                }
+              }
               Char('e') => {
-                if let Some((name, spec)) = self.current_hook() {
-                  self.set_prompt(Prompt::update_hook(
-                    name.to_string(),
-                    editable_spec(spec),
-                  ))?;
+                let current = self.current_hook().map(|(name, spec)| {
+                  (name.clone(), spec.clone())
+                });
+                if let Some((name, spec)) = current {
+                  if self.tasks.is_empty() {
+                    self.set_prompt(Prompt::update_hook(
+                      name,
+                      editable_spec(&spec),
+                    ))?;
+                  } else {
+                    let selected =
+                      selected_tasks_from_spec(&spec, &self.tasks);
+                    let next_task =
+                      selected.first().copied().unwrap_or(self.task);
+                    self.task = next_task;
+                    self.set_prompt(Prompt::pick_task(
+                      name,
+                      SpecEditMode::Update,
+                      editable_spec(&spec),
+                      selected,
+                    ))?;
+                  }
                 }
               }
               Char('d') => {
@@ -579,33 +711,93 @@ impl Drawable for DashboardState<'_> {
       );
     f.render_widget(header, layout[0]);
 
-    // Main area: list + details.
+    // Main area: list + details (responsive columns).
+    let main_area = layout[1];
+    let use_columns = main_area.width >= MIN_TWO_COLUMN_WIDTH;
+    let constraints = if use_columns {
+      [Constraint::Percentage(50), Constraint::Percentage(50)]
+    } else {
+      [Constraint::Min(MIN_PANEL_HEIGHT), Constraint::Min(MIN_PANEL_HEIGHT)]
+    };
     let main = Layout::default()
-      .direction(Direction::Horizontal)
-      .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-      .split(layout[1]);
-
-    let left = Layout::default()
-      .direction(Direction::Vertical)
-      .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-      .split(main[0]);
-
-    let hook_items: Vec<ListItem> = self
-      .hooks
-      .iter()
-      .enumerate()
-      .map(|(i, (name, _))| {
-        let marker = if i == self.index { "›" } else { " " };
-        let style = if i == self.index {
-          Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-        } else {
-          Style::default()
-        };
-        ListItem::new(Span::styled(format!("{marker} {name}"), style))
+      .direction(if use_columns {
+        Direction::Horizontal
+      } else {
+        Direction::Vertical
       })
-      .collect();
+      .constraints(constraints)
+      .split(main_area);
+
+    let hooks_area = main[0];
+    let tasks_area = main[1];
+    let (hooks_list_area, hooks_detail_area) = split_list_detail(hooks_area);
+
+    let (hook_items, hook_selected, hook_title, hook_detail_title, hook_text) =
+      if let Some(PromptKind::PickHook { options, index }) =
+        self.prompt.as_ref().map(|p| &p.kind)
+      {
+        let items: Vec<ListItem> = options
+          .iter()
+          .enumerate()
+          .map(|(i, name)| {
+            let marker = if i == *index { "›" } else { " " };
+            let style = if i == *index {
+              Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+            } else {
+              Style::default()
+            };
+            ListItem::new(Span::styled(format!("{marker} {name}"), style))
+          })
+          .collect();
+        (
+          items,
+          Some(*index),
+          " Add Hook ".to_string(),
+          " Hook Selection ".to_string(),
+          "Pick a hook name to add.".to_string(),
+        )
+      } else {
+        let items: Vec<ListItem> = self
+          .hooks
+          .iter()
+          .enumerate()
+          .map(|(i, (name, _))| {
+            let marker = if i == self.index { "›" } else { " " };
+            let style = if i == self.index {
+              Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+            } else {
+              Style::default()
+            };
+            ListItem::new(Span::styled(format!("{marker} {name}"), style))
+          })
+          .collect();
+        let detail_text = if let Some((_, spec)) = self.current_hook() {
+          format_spec(spec)
+        } else {
+          "No hooks configured.".into()
+        };
+        let detail_title = if let Some((s, _)) = self.current_hook() {
+          format!(" {s} ")
+        } else {
+          " Task Specification ".to_string()
+        };
+        let selected = if self.hooks.is_empty() {
+          None
+        } else {
+          Some(self.index)
+        };
+        (
+          items,
+          selected,
+          " Hooks (↑↓ to move, Enter to run) ".to_string(),
+          detail_title,
+          detail_text,
+        )
+      };
 
     let list = List::new(hook_items).block(
       Block::default()
@@ -621,16 +813,16 @@ impl Drawable for DashboardState<'_> {
           BorderType::Rounded
         })
         .padding(Padding::uniform(1))
-        .title(" Hooks (↑↓ to move, Enter to run) "),
+        .title(hook_title),
     );
-    f.render_widget(list, left[0]);
-
-    let spec_text = if let Some((_, spec)) = self.current_hook() {
-      format_spec(spec)
+    if hook_selected.is_some() {
+      self.hook_state.select(hook_selected);
     } else {
-      "No hooks configured.".into()
-    };
-    let detail = Paragraph::new(spec_text)
+      self.hook_state.select(None);
+    }
+    f.render_stateful_widget(list, hooks_list_area, &mut self.hook_state);
+
+    let detail = Paragraph::new(hook_text)
       .block(
         Block::default()
           .borders(Borders::ALL)
@@ -645,30 +837,33 @@ impl Drawable for DashboardState<'_> {
             Style::default()
           })
           .padding(Padding::uniform(1))
-          .title(format!(
-            " {name} ",
-            name = if let Some((s, _)) = self.current_hook() {
-              s.clone()
-            } else {
-              "Task Specification".into()
-            }
-          )),
+          .title(hook_detail_title),
       )
       .wrap(ratatui::widgets::Wrap { trim: true });
-    f.render_widget(detail, left[1]);
+    f.render_widget(detail, hooks_detail_area);
 
-    // task list (right panel)
-
-    let config = self
-      .discover_config()
-      .expect("No config file found in current directory.");
-
-    let task_items: Vec<ListItem> = config
-      .tasks()
+    // Tasks + details.
+    let mut task_picker_selection: Vec<usize> = Vec::new();
+    let is_task_picker = if let Some(PromptKind::PickTask { selections, .. }) =
+      self.prompt.as_ref().map(|p| &p.kind)
+    {
+      task_picker_selection = selections.clone();
+      true
+    } else {
+      false
+    };
+    let task_items: Vec<ListItem> = self
+      .tasks
       .iter()
       .enumerate()
       .map(|(i, (name, _))| {
         let marker = if i == self.task { "›" } else { " " };
+        let selected = task_picker_selection.contains(&i);
+        let badge = if is_task_picker {
+          if selected { "[x]" } else { "[ ]" }
+        } else {
+          ""
+        };
         let style = if i == self.task {
           Style::default()
             .fg(Color::Yellow)
@@ -676,35 +871,69 @@ impl Drawable for DashboardState<'_> {
         } else {
           Style::default()
         };
-        let content = Span::styled(format!("{marker} {name}"), style);
-        ListItem::new(content)
+        let content = if badge.is_empty() {
+          format!("{marker} {name}")
+        } else {
+          format!("{marker} {badge} {name}")
+        };
+        ListItem::new(Span::styled(content, style))
       })
       .collect();
-    let HookConfig {
-      deno_tasks,
-      node_scripts,
-      source,
-      ..
-    } = config;
-    let src = source.file_name();
-    let label = match (deno_tasks.len(), node_scripts.len()) {
-      (0, 0) | (_, 0) => "Tasks",
-      (0, _) => "Scripts",
-      (_, _) => "Tasks & Scripts",
-    };
     let task_list = List::new(task_items).block(
       Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().dim())
-        .border_type(if self.focus == Focus::Tasks {
+        .border_style(if self.focus == Focus::Tasks || is_task_picker {
+          Style::default().fg(Color::Yellow)
+        } else {
+          Style::default().dim()
+        })
+        .border_type(if self.focus == Focus::Tasks || is_task_picker {
           BorderType::Double
         } else {
           BorderType::Rounded
         })
         .padding(Padding::uniform(1))
-        .title(format!(" {label} ({src}) ")),
+        .title(format!(" {} ({}) ", self.task_label, self.task_source)),
     );
-    f.render_widget(task_list, main[1]);
+    let (tasks_list_area, tasks_detail_area) = split_list_detail(tasks_area);
+    if self.tasks.is_empty() {
+      self.task_state.select(None);
+    } else {
+      self.task_state.select(Some(self.task));
+    }
+    f.render_stateful_widget(task_list, tasks_list_area, &mut self.task_state);
+
+    let task_spec_text = if let Some((_, spec)) = self.current_task() {
+      format_spec(spec)
+    } else {
+      "No tasks configured.".into()
+    };
+    let task_detail = Paragraph::new(task_spec_text)
+      .block(
+        Block::default()
+          .borders(Borders::ALL)
+          .border_type(if self.focus == Focus::Tasks || is_task_picker {
+            BorderType::Thick
+          } else {
+            BorderType::Rounded
+          })
+          .border_style(if self.focus == Focus::Tasks || is_task_picker {
+            Style::default().fg(Color::Yellow)
+          } else {
+            Style::default()
+          })
+          .padding(Padding::uniform(1))
+          .title(format!(
+            " {name} ",
+            name = if let Some((name, _)) = self.current_task() {
+              name.to_string()
+            } else {
+              "Task Specification".into()
+            }
+          )),
+      )
+      .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(task_detail, tasks_detail_area);
 
     // Log panel.
     let log_view_height = layout[2].height.saturating_sub(2).max(1) as usize;
@@ -748,7 +977,7 @@ impl Drawable for DashboardState<'_> {
       (
         None,
         Text::from(
-          " [enter] run · [a] add · [e] edit · [d] delete  |  [r] reload · [q] quit  |  [tab] toggle focus",
+          " [enter] run · [a] add · [e] edit · [d] delete · [F2] manual spec  |  [r] reload · [q] quit  |  [tab] toggle focus",
         ),
       )
     };
@@ -805,19 +1034,27 @@ impl<'a> DashboardState<'a> {
     hooks.sort_by(|a, b| a.0.cmp(&b.0));
 
     let cwd = cfg.source.as_path().parent().unwrap_or(Path::new("."));
-    let tasks = cfg.tasks();
+    let tasks = cfg
+      .tasks()
+      .into_iter()
+      .map(|(name, spec)| (name.to_string(), spec))
+      .collect();
     Self {
       cwd,
       hooks,
       index: 0,
       tasks,
       task: 0,
+      hook_state: ListState::default(),
+      task_state: ListState::default(),
       running: false,
       logs: Vec::new(),
       prompt: None,
       focus: Focus::Hooks,
       scroll: 0,
       source: cfg.source.as_str().to_string(),
+      task_label: task_source_label(cfg),
+      task_source: cfg.source.file_name().to_string(),
     }
   }
 }
@@ -834,11 +1071,25 @@ impl<'a> DashboardState<'a> {
     if self.index >= self.hooks.len() && !self.hooks.is_empty() {
       self.index = self.hooks.len() - 1;
     }
+    self.tasks = cfg
+      .tasks()
+      .into_iter()
+      .map(|(name, spec)| (name.to_string(), spec))
+      .collect();
+    if self.task >= self.tasks.len() && !self.tasks.is_empty() {
+      self.task = self.tasks.len() - 1;
+    }
     self.source = cfg.source.as_str().to_string();
+    self.task_label = task_source_label(cfg);
+    self.task_source = cfg.source.file_name().to_string();
   }
 
   pub fn current_hook(&self) -> Option<(&String, &TaskSpec)> {
     self.hooks.get(self.index).map(|(name, spec)| (name, spec))
+  }
+
+  pub fn current_task(&self) -> Option<(&String, &TaskSpec)> {
+    self.tasks.get(self.task).map(|(name, spec)| (name, spec))
   }
 
   pub fn move_selection_up(&mut self) {
@@ -1052,7 +1303,73 @@ impl<'a> DashboardState<'a> {
           return match_common_input!(self, prompt, key);
         }
       },
+      PromptKind::PickHook { options, mut index } => match code {
+        Up => {
+          if index > 0 {
+            index -= 1;
+          }
+          self.set_prompt(Prompt {
+            kind: PromptKind::PickHook { options, index },
+            ..prompt
+          })?;
+          return Ok(true);
+        }
+        Down => {
+          if index + 1 < options.len() {
+            index += 1;
+          }
+          self.set_prompt(Prompt {
+            kind: PromptKind::PickHook { options, index },
+            ..prompt
+          })?;
+          return Ok(true);
+        }
+        Enter => {
+          if let Some(name) = options.get(index).cloned() {
+            if self.tasks.is_empty() {
+              self.set_prompt(Prompt::add_hook_spec(name))?;
+            } else {
+              self.set_prompt(Prompt::pick_task(
+                name,
+                SpecEditMode::Add,
+                String::new(),
+                Vec::new(),
+              ))?;
+            }
+          } else {
+            self.push_log(LogLevel::Error, "No hook selected.");
+            self.clear_prompt()?;
+          }
+          return Ok(true);
+        }
+        Char('\x04') | Char('\x03') | Esc => {
+          self.clear_prompt()?;
+          return Ok(true);
+        }
+        _ => {
+          self.set_prompt(prompt)?;
+          return Ok(true);
+        }
+      },
       PromptKind::AddSpec { hook } => match code {
+        F(2) => {
+          if self.tasks.is_empty() {
+            self.push_log(
+              LogLevel::Error,
+              "No tasks/scripts available to select.",
+            );
+            self.set_prompt(prompt)?;
+            return Ok(true);
+          }
+          let fallback = prompt.buffer.clone();
+          self.set_prompt(Prompt::pick_task(
+            hook,
+            SpecEditMode::Add,
+            fallback,
+            Vec::new(),
+          ))?;
+          return Ok(true);
+        }
         Enter => {
           if prompt.buffer.trim().is_empty() {
             self
@@ -1060,11 +1377,19 @@ impl<'a> DashboardState<'a> {
             self.set_prompt(prompt)?;
             return Ok(true);
           }
-          if let Err(err) = self.add_hook(&hook, &*prompt.buffer) {
-            self.push_log(LogLevel::Error, format!("{err}"));
-            self.set_prompt(prompt)?;
-          } else {
-            self.clear_prompt()?;
+          match parse_spec_input(&prompt.buffer) {
+            Ok(spec) => {
+              if let Err(err) = self.add_hook(&hook, spec) {
+                self.push_log(LogLevel::Error, format!("{err}"));
+                self.set_prompt(prompt)?;
+              } else {
+                self.clear_prompt()?;
+              }
+            }
+            Err(err) => {
+              self.push_log(LogLevel::Error, format!("{err}"));
+              self.set_prompt(prompt)?;
+            }
           }
         }
         Char('\x04') | Char('\x03') | Esc => {
@@ -1076,12 +1401,44 @@ impl<'a> DashboardState<'a> {
         }
       },
       PromptKind::Update { hook } => match code {
-        Enter => {
-          if let Err(err) = self.update_hook(&hook, &*prompt.buffer) {
-            self.push_log(LogLevel::Error, format!("{err}"));
+        F(2) => {
+          if self.tasks.is_empty() {
+            self.push_log(
+              LogLevel::Error,
+              "No tasks/scripts available to select.",
+            );
             self.set_prompt(prompt)?;
-          } else {
-            self.clear_prompt()?;
+            return Ok(true);
+          }
+          let fallback = prompt.buffer.clone();
+          self.set_prompt(Prompt::pick_task(
+            hook,
+            SpecEditMode::Update,
+            fallback,
+            Vec::new(),
+          ))?;
+          return Ok(true);
+        }
+        Enter => {
+          if prompt.buffer.trim().is_empty() {
+            self
+              .push_log(LogLevel::Error, "Task specification cannot be empty.");
+            self.set_prompt(prompt)?;
+            return Ok(true);
+          }
+          match parse_spec_input(&prompt.buffer) {
+            Ok(spec) => {
+              if let Err(err) = self.update_hook(&hook, spec) {
+                self.push_log(LogLevel::Error, format!("{err}"));
+                self.set_prompt(prompt)?;
+              } else {
+                self.clear_prompt()?;
+              }
+            }
+            Err(err) => {
+              self.push_log(LogLevel::Error, format!("{err}"));
+              self.set_prompt(prompt)?;
+            }
           }
         }
         Char('\x04') | Char('\x03') | Esc => {
@@ -1090,6 +1447,128 @@ impl<'a> DashboardState<'a> {
         }
         key => {
           return match_common_input!(self, prompt, key);
+        }
+      },
+      PromptKind::PickTask {
+        hook,
+        mode,
+        fallback,
+        mut selections,
+        mut index,
+      } => match code {
+        Up => {
+          if index > 0 {
+            index -= 1;
+          }
+          self.task = index;
+          self.set_prompt(Prompt {
+            kind: PromptKind::PickTask {
+              hook,
+              mode,
+              fallback,
+              selections,
+              index,
+            },
+            ..prompt
+          })?;
+          return Ok(true);
+        }
+        Down => {
+          if index + 1 < self.tasks.len() {
+            index += 1;
+          }
+          self.task = index;
+          self.set_prompt(Prompt {
+            kind: PromptKind::PickTask {
+              hook,
+              mode,
+              fallback,
+              selections,
+              index,
+            },
+            ..prompt
+          })?;
+          return Ok(true);
+        }
+        Char(' ') => {
+          if self.tasks.is_empty() {
+            self.set_prompt(prompt)?;
+            return Ok(true);
+          }
+          if selections.contains(&index) {
+            selections.retain(|idx| *idx != index);
+          } else {
+            selections.push(index);
+          }
+          selections.sort_unstable();
+          self.set_prompt(Prompt {
+            kind: PromptKind::PickTask {
+              hook,
+              mode,
+              fallback,
+              selections,
+              index,
+            },
+            ..prompt
+          })?;
+          return Ok(true);
+        }
+        F(2) => {
+          match mode {
+            SpecEditMode::Add => {
+              self.set_prompt(Prompt::add_hook_spec_with_buffer(
+                hook, fallback,
+              ))?;
+            }
+            SpecEditMode::Update => {
+              self.set_prompt(Prompt::update_hook(hook, fallback))?;
+            }
+          }
+          return Ok(true);
+        }
+        Enter => {
+          if selections.is_empty() {
+            self.push_log(LogLevel::Error, "Select at least one task.");
+            self.set_prompt(Prompt {
+              kind: PromptKind::PickTask {
+                hook,
+                mode,
+                fallback,
+                selections,
+                index,
+              },
+              ..prompt
+            })?;
+            return Ok(true);
+          }
+          if let Some(spec) =
+            task_spec_from_selection(&selections, &self.tasks)
+          {
+            let result = match mode {
+              SpecEditMode::Add => self.add_hook(&hook, spec),
+              SpecEditMode::Update => self.update_hook(&hook, spec),
+            };
+            if let Err(err) = result {
+              self.push_log(LogLevel::Error, format!("{err}"));
+              self.set_prompt(Prompt::pick_task(
+                hook,
+                mode,
+                fallback,
+                selections,
+              ))?;
+              return Ok(true);
+            }
+          }
+          self.clear_prompt()?;
+          return Ok(true);
+        }
+        Char('\x04') | Char('\x03') | Esc => {
+          self.clear_prompt()?;
+          return Ok(true);
+        }
+        _ => {
+          self.set_prompt(prompt)?;
+          return Ok(true);
         }
       },
     }
@@ -1161,17 +1640,60 @@ impl Prompt {
   pub fn add_hook_spec(hook: String) -> Self {
     Self {
       kind: PromptKind::AddSpec { hook: hook.clone() },
-      label: format!("Spec for '{hook}'"),
+      label: format!("Manual spec for '{hook}'"),
       ..Default::default()
+    }
+  }
+
+  pub fn add_hook_spec_with_buffer(hook: String, buffer: String) -> Self {
+    let cursor_index = buffer.len();
+    Self {
+      kind: PromptKind::AddSpec { hook: hook.clone() },
+      label: format!("Manual spec for '{hook}'"),
+      buffer,
+      cursor_index,
     }
   }
 
   pub fn update_hook(hook: String, preset: String) -> Self {
     Self {
       kind: PromptKind::Update { hook: hook.clone() },
-      label: format!("New spec for '{hook}'"),
+      label: format!("Manual spec for '{hook}'"),
       buffer: preset.clone(),
       cursor_index: preset.len(),
+      ..Default::default()
+    }
+  }
+
+  pub fn pick_task(
+    hook: String,
+    mode: SpecEditMode,
+    fallback: String,
+    selections: Vec<usize>,
+  ) -> Self {
+    let index = selections.first().copied().unwrap_or(0);
+    Self {
+      kind: PromptKind::PickTask {
+        hook: hook.clone(),
+        mode,
+        fallback,
+        selections,
+        index,
+      },
+      label: format!(
+        "Pick tasks for '{hook}' (↑↓ move, Space toggle, Enter confirm, F2 manual)"
+      ),
+      ..Default::default()
+    }
+  }
+
+  pub fn pick_hook(options: Vec<String>) -> Self {
+    Self {
+      kind: PromptKind::PickHook {
+        options,
+        index: 0,
+      },
+      label: "Select hook to add (↑↓ move, Enter confirm)".into(),
       ..Default::default()
     }
   }
@@ -1193,6 +1715,17 @@ pub enum PromptKind {
   AddName,
   AddSpec { hook: String },
   Update { hook: String },
+  PickHook {
+    options: Vec<String>,
+    index:   usize,
+  },
+  PickTask {
+    hook:     String,
+    mode:     SpecEditMode,
+    fallback: String,
+    selections: Vec<usize>,
+    index: usize,
+  },
 }
 
 trait PromptCursor {
