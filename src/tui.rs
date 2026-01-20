@@ -31,6 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
+use ratatui::prelude::Stylize;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -44,6 +45,8 @@ use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 use ratatui::widgets::Padding;
 use ratatui::widgets::Paragraph;
+use serde_json::Map;
+use serde_json::Value;
 
 use crate::cli::DashboardOpts;
 use crate::config::*;
@@ -109,19 +112,19 @@ pub fn handle_dashboard(_opts: &DashboardOpts) -> Result<(), RunnerError> {
   result
 }
 
-trait Drawable {
+pub trait Drawable {
   fn draw(&mut self, f: &mut ratatui::Frame<'_>);
 }
 
-trait InputHandler {
+pub trait InputHandler {
   fn handle_input(&mut self, code: KeyCode) -> Result<bool, RunnerError>;
 }
 
-trait MouseHandler {
+pub trait MouseHandler {
   fn handle_mouse(&mut self, event: MouseEvent);
 }
 
-trait Runnable<'a> {
+pub trait Runnable<'a> {
   fn run(
     &mut self,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -132,39 +135,47 @@ trait Runnable<'a> {
 fn wrap_text_lines(text: &str, width: u16) -> Vec<String> {
   let usable_width = width.max(1) as usize;
   let mut lines = Vec::new();
+
   for raw_line in text.split('\n') {
     if raw_line.is_empty() {
       lines.push(String::new());
       continue;
     }
+
     let mut current = String::new();
     let mut current_len = 0usize;
+
     for ch in raw_line.chars() {
       if current_len >= usable_width {
         lines.push(current);
         current = String::new();
         current_len = 0;
       }
+
       current.push(ch);
       current_len += 1;
     }
+
     lines.push(current);
   }
+
   if lines.is_empty() {
     lines.push(String::new());
   }
+
   lines
 }
 
 fn format_spec(spec: &TaskSpec) -> String {
-  serde_json::to_string(&spec.to_json()).unwrap_or_else(|_| spec.to_string())
+  serde_json::to_string(&spec.to_json_value())
+    .unwrap_or_else(|_| spec.to_json())
 }
 
 fn editable_spec(spec: &TaskSpec) -> String {
   match spec {
-    TaskSpec::Single(s) => s.clone(),
-    _ => serde_json::to_string(&spec.to_json())
-      .unwrap_or_else(|_| spec.to_string()),
+    TaskSpec::Single(s) => s.to_string(),
+    _ => serde_json::to_string(&spec.to_json_value())
+      .unwrap_or_else(|_| spec.to_json()),
   }
 }
 
@@ -172,57 +183,73 @@ fn editable_spec(spec: &TaskSpec) -> String {
 pub enum Focus {
   #[default]
   Hooks,
+  Tasks,
   Output,
+  Input,
 }
 
 impl Focus {
   fn next(self) -> Self {
+    use Focus::*;
     match self {
-      Focus::Hooks => Focus::Output,
-      Focus::Output => Focus::Hooks,
+      Hooks => Tasks,
+      Tasks => Output,
+      Output => Input,
+      Input => Hooks,
     }
   }
 
   fn prev(self) -> Self {
-    self.next()
+    use Focus::*;
+    match self {
+      Hooks => Input,
+      Tasks => Hooks,
+      Output => Tasks,
+      Input => Output,
+    }
   }
 }
 
 /// Internal state for the dashboard.
 #[derive(Clone, Constructor)]
 pub struct DashboardState<'a> {
-  pub cwd:        &'a Path,
-  pub running:    bool,
-  pub hooks:      Vec<(String, TaskSpec)>,
-  pub index:      usize,
-  pub logs:       Vec<LogEntry>,
-  pub prompt:     Option<Prompt>,
-  pub focus:      Focus,
-  pub log_scroll: usize,
-  pub source:     String,
+  pub cwd:     &'a Path,
+  pub running: bool,
+  pub hooks:   Vec<(String, TaskSpec)>,
+  pub index:   usize,
+  pub tasks:   Vec<(CowStr<'a>, TaskSpec)>,
+  pub task:    usize,
+  pub logs:    Vec<LogEntry>,
+  pub prompt:  Option<Prompt>,
+  pub focus:   Focus,
+  pub scroll:  usize,
+  pub source:  String,
 }
 
 impl<'a> Default for DashboardState<'a> {
   fn default() -> Self {
     Self {
-      cwd:        Path::new("."),
-      running:    false,
-      hooks:      Vec::new(),
-      index:      0,
-      logs:       Vec::new(),
-      prompt:     None,
-      focus:      Focus::Hooks,
-      log_scroll: 0,
-      source:     String::new(),
+      cwd:     Path::new("."),
+      running: false,
+      hooks:   vec![],
+      index:   0,
+      tasks:   vec![],
+      task:    0,
+      logs:    vec![],
+      prompt:  None,
+      focus:   Focus::Hooks,
+      scroll:  0,
+      source:  String::new(),
     }
   }
 }
 
-trait HookManager<'a>
+pub trait HookManager<'a>
 where
   Self: Sized + 'a,
 {
   fn selected_hook(&'a self) -> Option<(CowStr<'a>, &'a TaskSpec)>;
+
   fn cwd(&self) -> &Path;
 
   fn add_hook<T: TryInto<TaskSpec>>(
@@ -232,9 +259,21 @@ where
   ) -> Result<(), RunnerError>
   where
     <T as TryInto<TaskSpec>>::Error: Into<RunnerError>;
+
   fn refresh_config(&mut self) -> Result<(), RunnerError>;
+
   fn remove_hook(&mut self, name: &str) -> Result<(), RunnerError>;
-  fn run_hook(&mut self, name: &str) -> Result<(), RunnerError>;
+
+  fn run_hook(&mut self, name: &str) -> Result<(), RunnerError> {
+    self.run_hook_with(name, &[])
+  }
+
+  fn run_hook_with(
+    &mut self,
+    name: &str,
+    args: &[String],
+  ) -> Result<(), RunnerError>;
+
   fn update_hook<T: TryInto<TaskSpec>>(
     &mut self,
     name: &str,
@@ -242,6 +281,19 @@ where
   ) -> Result<(), RunnerError>
   where
     <T as TryInto<TaskSpec>>::Error: Into<RunnerError>;
+
+  fn discover_config(&mut self) -> Result<HookConfig, RunnerError> {
+    HookConfig::discover(self.cwd()).map_err(Into::into)
+  }
+
+  fn mutate_hooks<F>(&mut self, mutator: F) -> Result<(), RunnerError>
+  where
+    F: FnOnce(&mut Map<String, Value>) -> Result<(), RunnerError>,
+  {
+    let cfg = self.discover_config()?;
+    mutate_hooks(&cfg, mutator)?;
+    self.refresh_config()
+  }
 }
 
 impl<'a> HookManager<'a> for DashboardState<'a> {
@@ -261,52 +313,54 @@ impl<'a> HookManager<'a> for DashboardState<'a> {
   fn add_hook<T: TryInto<TaskSpec>>(
     &mut self,
     hook: &str,
-    spec_input: T,
+    spec: T,
   ) -> Result<(), RunnerError>
   where
     <T as TryInto<TaskSpec>>::Error: Into<RunnerError>,
   {
     ensure_valid_hook_name(hook)?;
-    let spec = spec_input.try_into().map_err(Into::into)?;
-    let cfg = HookConfig::discover(self.cwd)?;
-    mutate_hooks(&cfg, |hooks| {
-      hooks.insert(hook.to_string(), spec.to_json());
+    let spec = spec.try_into().map_err(Into::into)?;
+    self.mutate_hooks(|hooks| {
+      hooks.insert(hook.to_string(), spec.to_json_value());
       Ok(())
     })?;
-    self.refresh_config()?;
     self.select_hook(hook);
     self.push_log(LogLevel::Success, format!("Added hook '{hook}'."));
+
     Ok(())
   }
 
   fn remove_hook(&mut self, hook: &str) -> Result<(), RunnerError> {
-    let cfg = HookConfig::discover(self.cwd)?;
-    mutate_hooks(&cfg, |hooks| {
+    self.mutate_hooks(|hooks| {
       hooks.remove(hook);
       Ok(())
     })?;
-    self.refresh_config()?;
+
     self.push_log(LogLevel::Success, format!("Removed hook '{hook}'."));
+
     Ok(())
   }
 
   fn update_hook<T: TryInto<TaskSpec>>(
     &mut self,
     hook: &str,
-    spec_input: T,
+    spec: T,
   ) -> Result<(), RunnerError>
   where
     <T as TryInto<TaskSpec>>::Error: Into<RunnerError>,
   {
-    let spec = spec_input.try_into().map_err(Into::into)?;
+    let spec = spec.try_into().map_err(Into::into)?;
     let cfg = HookConfig::discover(self.cwd)?;
+
     mutate_hooks(&cfg, |hooks| {
-      hooks.insert(hook.to_string(), spec.to_json());
+      hooks.insert(hook.to_string(), spec.to_json_value());
       Ok(())
     })?;
+
     self.refresh_config()?;
     self.select_hook(hook);
     self.push_log(LogLevel::Success, format!("Updated hook '{hook}'."));
+
     Ok(())
   }
 
@@ -325,25 +379,33 @@ impl<'a> HookManager<'a> for DashboardState<'a> {
     }
   }
 
-  fn run_hook(&mut self, name: &str) -> Result<(), RunnerError> {
+  fn run_hook_with(
+    &mut self,
+    hook: &str,
+    extra_args: &[String],
+  ) -> Result<(), RunnerError> {
     let cfg = HookConfig::discover(self.cwd)?;
-    let Some(spec) = cfg.hooks.get(name) else {
-      self.push_log(LogLevel::Error, format!("Hook '{name}' not found."));
+    let Some(spec) = cfg.hooks.get(hook) else {
+      self.push_log(LogLevel::Error, format!("Hook '{hook}' not found."));
       return Ok(());
     };
     self.apply_config(&cfg);
-    self.select_hook(name);
+    self.select_hook(hook);
+
     let mut runner = TaskRunner::new_with_capture(&cfg);
+
     self.running = true;
-    self.push_log(LogLevel::Info, format!("Running hook '{name}'..."));
-    let result = runner.run_spec(spec, name, &[]);
+    self.push_log(LogLevel::Info, format!("Running hook '{hook}'..."));
+    let result = runner.run_spec(spec, hook, extra_args);
     self.running = false;
+
     let output = runner.take_output();
     self.append_output(output);
+
     if let Err(err) = result {
       self.push_log(LogLevel::Error, format!("{err}"));
     } else {
-      self.push_log(LogLevel::Success, format!("Hook '{name}' finished."));
+      self.push_log(LogLevel::Success, format!("Hook '{hook}' finished."));
     }
     Ok(())
   }
@@ -368,8 +430,8 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
             if self.handle_input(code)? {
               continue;
             }
+            use Focus::*;
             use KeyCode::*;
-
             match code {
               Char('q') => break,
               Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -396,36 +458,62 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
               Tab => self.focus = self.focus.next(),
               BackTab => self.focus = self.focus.prev(),
               Up => match self.focus {
-                Focus::Hooks => self.move_selection_up(),
-                Focus::Output => self.scroll_logs(1),
+                Hooks => self.move_selection_up(),
+                Tasks => self.task = self.task.saturating_sub(1),
+                Output => self.scroll_logs(1),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_up()),
               },
               Down => match self.focus {
-                Focus::Hooks => self.move_selection_down(),
-                Focus::Output => self.scroll_logs(-1),
+                Hooks => self.move_selection_down(),
+                Tasks => {
+                  if self.task < self.tasks.len().saturating_sub(1) {
+                    self.task += 1;
+                  }
+                }
+                Output => self.scroll_logs(-1),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_down()),
               },
               Home => match self.focus {
-                Focus::Hooks => self.index = 0,
-                Focus::Output => self.scroll_to_log_start(),
+                Hooks => self.index = 0,
+                Tasks => self.task = 0,
+                Output => self.scroll_to_log_start(),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_home()),
               },
               End => match self.focus {
-                Focus::Hooks => self.index = self.hooks.len().saturating_sub(1),
-                Focus::Output => self.scroll_to_log_end(),
+                Hooks => self.index = self.hooks.len().saturating_sub(1),
+                Tasks => self.task = self.tasks.len().saturating_sub(1),
+                Output => self.scroll_to_log_end(),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_end()),
               },
               PageUp => match self.focus {
-                Focus::Hooks => {
+                Hooks => {
                   for _ in 0..3 {
                     self.move_selection_up();
                   }
                 }
-                Focus::Output => self.scroll_logs(5),
+                Tasks => {
+                  for _ in 0..3 {
+                    self.task = self.task.saturating_sub(1);
+                  }
+                }
+                Output => self.scroll_logs(self.status_height(0) as isize),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_up()),
               },
               PageDown => match self.focus {
-                Focus::Hooks => {
+                Hooks => {
                   for _ in 0..3 {
                     self.move_selection_down();
                   }
                 }
-                Focus::Output => self.scroll_logs(-5),
+                Tasks => {
+                  for _ in 0..3 {
+                    if self.task < self.tasks.len().saturating_sub(1) {
+                      self.task += 1;
+                    }
+                  }
+                }
+                Output => self.scroll_logs(-5),
+                Input => self.prompt.iter_mut().for_each(|p| p.move_down()),
               },
               Char('r') | Char('R') | F(5) => {
                 self.refresh_config()?;
@@ -456,7 +544,7 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
           Event::Mouse(mouse) => self.handle_mouse(mouse),
           Event::Resize(_, _) => {
             // Clamp scrolling when the window shrinks.
-            self.normalize_log_scroll();
+            self.normalize_scroll();
           }
           _ => {}
         }
@@ -474,32 +562,33 @@ impl Drawable for DashboardState<'_> {
       .direction(Direction::Vertical)
       .constraints([
         Constraint::Length(3),
-        Constraint::Min(10),
-        Constraint::Percentage(40),
-        Constraint::Length(status_height),
+        Constraint::Fill(2),
+        Constraint::Min(3),
+        Constraint::Min(status_height),
       ])
       .split(f.area());
 
-    let title = format!(
-      " huk dashboard — {} — {} hooks",
-      self.source,
-      self.hooks.len()
-    );
+    let title = format!(" {} — {} hooks", self.source, self.hooks.len());
     let header = Paragraph::new(Text::from(title))
       .style(Style::default().add_modifier(Modifier::BOLD))
       .block(
         Block::default()
           .borders(Borders::ALL)
           .border_type(BorderType::Rounded)
-          .title(format!("huk v{VERSION}")),
+          .title(format!(" huk v{VERSION} ")),
       );
     f.render_widget(header, layout[0]);
 
     // Main area: list + details.
     let main = Layout::default()
       .direction(Direction::Horizontal)
-      .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+      .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
       .split(layout[1]);
+
+    let left = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+      .split(main[0]);
 
     let hook_items: Vec<ListItem> = self
       .hooks
@@ -526,16 +615,18 @@ impl Drawable for DashboardState<'_> {
         } else {
           Style::default()
         })
-        .border_type(BorderType::Rounded)
+        .border_type(if self.focus == Focus::Hooks {
+          BorderType::Double
+        } else {
+          BorderType::Rounded
+        })
         .padding(Padding::uniform(1))
-        .title("Hooks (↑/↓ to move, Enter to run, a/e/d to add/edit/delete, r to reload, q to quit)"),
+        .title(" Hooks (↑↓ to move, Enter to run) "),
     );
-    f.render_widget(list, main[0]);
+    f.render_widget(list, left[0]);
 
-    let spec_text = if let Some((name, spec)) = self.current_hook() {
-      let mut text = format!("Hook: {name}\n\n");
-      text.push_str(&format_spec(spec));
-      text
+    let spec_text = if let Some((_, spec)) = self.current_hook() {
+      format_spec(spec)
     } else {
       "No hooks configured.".into()
     };
@@ -543,17 +634,82 @@ impl Drawable for DashboardState<'_> {
       .block(
         Block::default()
           .borders(Borders::ALL)
-          .border_type(BorderType::Rounded)
+          .border_type(if self.focus == Focus::Hooks {
+            BorderType::Thick
+          } else {
+            BorderType::Rounded
+          })
+          .border_style(if self.focus == Focus::Hooks {
+            Style::default().fg(Color::Yellow)
+          } else {
+            Style::default()
+          })
           .padding(Padding::uniform(1))
-          .title("Task Specification"),
+          .title(format!(
+            " {name} ",
+            name = if let Some((s, _)) = self.current_hook() {
+              s.clone()
+            } else {
+              "Task Specification".into()
+            }
+          )),
       )
       .wrap(ratatui::widgets::Wrap { trim: true });
-    f.render_widget(detail, main[1]);
+    f.render_widget(detail, left[1]);
+
+    // task list (right panel)
+
+    let config = self
+      .discover_config()
+      .expect("No config file found in current directory.");
+
+    let task_items: Vec<ListItem> = config
+      .tasks()
+      .iter()
+      .enumerate()
+      .map(|(i, (name, _))| {
+        let marker = if i == self.task { "›" } else { " " };
+        let style = if i == self.task {
+          Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+        } else {
+          Style::default()
+        };
+        let content = Span::styled(format!("{marker} {name}"), style);
+        ListItem::new(content)
+      })
+      .collect();
+    let HookConfig {
+      deno_tasks,
+      node_scripts,
+      source,
+      ..
+    } = config;
+    let src = source.file_name();
+    let label = match (deno_tasks.len(), node_scripts.len()) {
+      (0, 0) | (_, 0) => "Tasks",
+      (0, _) => "Scripts",
+      (_, _) => "Tasks & Scripts",
+    };
+    let task_list = List::new(task_items).block(
+      Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().dim())
+        .border_type(if self.focus == Focus::Tasks {
+          BorderType::Double
+        } else {
+          BorderType::Rounded
+        })
+        .padding(Padding::uniform(1))
+        .title(format!(" {label} ({src}) ")),
+    );
+    f.render_widget(task_list, main[1]);
 
     // Log panel.
     let log_view_height = layout[2].height.saturating_sub(2).max(1) as usize;
     let max_scroll = self.logs.len().saturating_sub(log_view_height);
-    let scroll = self.log_scroll.min(max_scroll);
+    let scroll = self.scroll.min(max_scroll);
     let start = self
       .logs
       .len()
@@ -572,9 +728,9 @@ impl Drawable for DashboardState<'_> {
             Style::default()
           })
           .border_type(BorderType::Rounded)
-          .title("Output"),
+          .title(" Output "),
       )
-      .wrap(ratatui::widgets::Wrap { trim: true });
+      .wrap(ratatui::widgets::Wrap { trim: false });
 
     f.render_widget(log, layout[2]);
 
@@ -592,7 +748,7 @@ impl Drawable for DashboardState<'_> {
       (
         None,
         Text::from(
-          " Hook Actions:  [enter] run · [a] add · [e] edit · [d] delete  |  [r] reload · [q] quit  |  [tab] toggle focus",
+          " [enter] run · [a] add · [e] edit · [d] delete  |  [r] reload · [q] quit  |  [tab] toggle focus",
         ),
       )
     };
@@ -648,15 +804,19 @@ impl<'a> DashboardState<'a> {
       .collect();
     hooks.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let cwd = cfg.source.as_path().parent().unwrap_or(Path::new("."));
+    let tasks = cfg.tasks();
     Self {
-      cwd: cfg.source.as_path().parent().unwrap_or(Path::new(".")),
+      cwd,
       hooks,
       index: 0,
+      tasks,
+      task: 0,
       running: false,
       logs: Vec::new(),
       prompt: None,
       focus: Focus::Hooks,
-      log_scroll: 0,
+      scroll: 0,
       source: cfg.source.as_str().to_string(),
     }
   }
@@ -697,21 +857,25 @@ impl<'a> DashboardState<'a> {
       message: message.into(),
       timestamp: chrono::Local::now(),
     });
-    if self.log_scroll > 0 {
-      self.log_scroll += 1;
+    if self.scroll > 0 {
+      self.scroll += 1;
     }
     if self.logs.len() > LOG_LIMIT {
       let excess = self.logs.len() - LOG_LIMIT;
       self.logs.drain(0..excess);
-      self.normalize_log_scroll();
+      self.normalize_scroll();
     }
   }
 
   pub fn append_output(&mut self, chunks: Vec<OutputChunk>) {
     for chunk in chunks {
       match chunk {
-        OutputChunk::Stdout(s) => self.push_log(LogLevel::Stdout, s),
-        OutputChunk::Stderr(s) => self.push_log(LogLevel::Stderr, s),
+        OutputChunk::Stdout(s) => {
+          self.push_log(LogLevel::Stdout, s.replace('\r', "\n"))
+        }
+        OutputChunk::Stderr(s) => {
+          self.push_log(LogLevel::Stderr, s.replace('\r', "\n"))
+        }
       }
     }
   }
@@ -742,39 +906,39 @@ impl<'a> DashboardState<'a> {
 
   pub fn scroll_logs(&mut self, delta: isize) {
     if self.logs.is_empty() {
-      self.log_scroll = 0;
+      self.scroll_to_log_end();
       return;
     }
     let max = self.logs.len().saturating_sub(1);
     if delta.is_negative() {
       let amount = delta.wrapping_abs() as usize;
-      self.log_scroll = self.log_scroll.saturating_sub(amount);
+      self.scroll = self.scroll.saturating_sub(amount);
     } else {
       let amount = delta as usize;
-      self.log_scroll = (self.log_scroll + amount).min(max);
+      self.scroll = (self.scroll + amount).min(max);
     }
   }
 
   pub fn scroll_to_log_start(&mut self) {
     if self.logs.is_empty() {
-      self.log_scroll = 0;
+      self.scroll_to_log_end();
     } else {
-      self.log_scroll = self.logs.len().saturating_sub(1);
+      self.scroll = self.logs.len().saturating_sub(1);
     }
   }
 
   pub fn scroll_to_log_end(&mut self) {
-    self.log_scroll = 0;
+    self.scroll = 0;
   }
 
-  pub fn normalize_log_scroll(&mut self) {
+  pub fn normalize_scroll(&mut self) {
     if self.logs.is_empty() {
-      self.log_scroll = 0;
+      self.scroll_to_log_end();
       return;
     }
     let max = self.logs.len().saturating_sub(1);
-    if self.log_scroll > max {
-      self.log_scroll = max;
+    if self.scroll > max {
+      self.scroll = max;
     }
   }
 
@@ -789,17 +953,20 @@ impl<'a> DashboardState<'a> {
   }
 
   fn handle_mouse_event(&mut self, event: MouseEvent) {
-    match event.kind {
-      MouseEventKind::ScrollUp => {
-        self.focus = Focus::Output;
-        self.scroll_logs(2);
-      }
-      MouseEventKind::ScrollDown => {
-        self.focus = Focus::Output;
-        self.scroll_logs(-2);
-      }
-      _ => {}
+    let mut delta = match event.kind {
+      MouseEventKind::ScrollUp => 1,
+      MouseEventKind::ScrollDown => -1,
+      _ => 0,
+    };
+    use KeyModifiers as KM;
+    if event.modifiers.contains(KM::ALT) || event.modifiers.contains(KM::META) {
+      delta *= 3;
     }
+    if event.modifiers.contains(KM::SHIFT) {
+      delta *= 2;
+    }
+    self.focus = Focus::Output;
+    self.scroll_logs(delta);
   }
 
   fn handle_prompt_input(
@@ -1248,13 +1415,18 @@ impl LogEntry {
       LogLevel::Error => ("fail", Color::LightRed),
     };
     let time = self.timestamp.format("%H:%M:%S").to_string();
+    let prefix = format!("{label} [{time}] ");
+    let mut indent = String::from('\n');
+    for _ in 0..prefix.len() {
+      indent.push(' ');
+    }
     Line::from(vec![
       Span::styled(
         format!("{label} "),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
       ),
       Span::styled(format!("[{time}] "), Style::default().fg(Color::DarkGray)),
-      Span::raw(&self.message),
+      Span::raw(self.message.replace(['\r', '\n'], &indent)),
     ])
   }
 }
