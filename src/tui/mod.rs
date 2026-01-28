@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::io::Stdout;
+use std::io::Write;
 use std::io::{self};
 use std::path::Path;
 use std::time::Duration;
@@ -59,13 +60,7 @@ use crate::runner::TaskRunner;
 use crate::runner::mutate_hooks;
 use crate::task::TaskSpec;
 
-const LOG_LIMIT: usize = 2000;
-const BASE_SCROLL_DELTA: usize = 2;
-const FAST_SCROLL_MULTIPLIER: usize = 3;
-const MIN_TWO_COLUMN_WIDTH: u16 = 88;
-const MIN_PANEL_HEIGHT: u16 = 8;
-const MIN_LIST_HEIGHT: u16 = 6;
-const MIN_DETAIL_HEIGHT: u16 = 5;
+pub(crate) mod constants;
 
 macro_rules! match_common_input {
   ($state:expr, $prompt:expr, $code:expr) => {{
@@ -130,12 +125,57 @@ pub trait MouseHandler {
   fn handle_mouse(&mut self, event: MouseEvent);
 }
 
-pub trait Runnable<'a> {
+pub trait Runnable<'a, W: Write = Stdout> {
   fn run(
     &mut self,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<W>>,
     cwd: &'a Path,
   ) -> Result<(), RunnerError>;
+}
+
+pub trait HookManager<'a>
+where
+  Self: Sized + 'a,
+{
+  fn selected_hook(&'a self) -> Option<(CowStr<'a>, &'a TaskSpec)>;
+
+  fn cwd(&self) -> &Path;
+
+  fn add_hook(&mut self, name: &str, spec: TaskSpec)
+  -> Result<(), RunnerError>;
+
+  fn refresh_config(&mut self) -> Result<(), RunnerError>;
+
+  fn remove_hook(&mut self, name: &str) -> Result<(), RunnerError>;
+
+  fn run_hook(&mut self, name: &str) -> Result<(), RunnerError> {
+    self.run_hook_with(name, &[])
+  }
+
+  fn run_hook_with(
+    &mut self,
+    name: &str,
+    args: &[String],
+  ) -> Result<(), RunnerError>;
+
+  fn update_hook(
+    &mut self,
+    name: &str,
+    spec: TaskSpec,
+  ) -> Result<(), RunnerError>;
+
+  fn discover_config(&mut self) -> Result<HookConfig, RunnerError> {
+    HookConfig::discover(self.cwd()).map_err(Into::into)
+  }
+
+  fn mutate_hooks<F>(&mut self, mutator: F) -> Result<(), RunnerError>
+  where
+    F: FnOnce(&mut Map<String, Value>) -> Result<(), RunnerError>,
+  {
+    let cfg = self.discover_config()?;
+    mutate_hooks(&cfg, mutator)?;
+    self.refresh_config()
+  }
 }
 
 fn wrap_text_lines(text: &str, width: u16) -> Vec<String> {
@@ -230,29 +270,29 @@ fn task_source_label(cfg: &HookConfig) -> String {
 }
 
 fn split_list_detail(area: Rect) -> (Rect, Rect) {
-  let min_total = MIN_LIST_HEIGHT.saturating_add(MIN_DETAIL_HEIGHT);
-  let mut list_height =
-    ((area.height as f32) * 0.35).round() as u16;
+  let min_total =
+    constants::MIN_LIST_HEIGHT.saturating_add(constants::MIN_DETAIL_HEIGHT);
+  let mut list_height = ((area.height as f32) * 0.35).round() as u16;
 
   if area.height <= min_total {
     list_height = area.height / 2;
   } else {
     list_height = list_height
-      .max(MIN_LIST_HEIGHT)
-      .min(area.height.saturating_sub(MIN_DETAIL_HEIGHT));
+      .max(constants::MIN_LIST_HEIGHT)
+      .min(area.height.saturating_sub(constants::MIN_DETAIL_HEIGHT));
   }
 
   let detail_height = area.height.saturating_sub(list_height);
   let list_rect = Rect {
-    x: area.x,
-    y: area.y,
-    width: area.width,
+    x:      area.x,
+    y:      area.y,
+    width:  area.width,
     height: list_height,
   };
   let detail_rect = Rect {
-    x: area.x,
-    y: area.y.saturating_add(list_height),
-    width: area.width,
+    x:      area.x,
+    y:      area.y.saturating_add(list_height),
+    width:  area.width,
     height: detail_height,
   };
   (list_rect, detail_rect)
@@ -275,22 +315,24 @@ fn selected_tasks_from_spec(
   let mut selected = Vec::new();
   match spec {
     TaskSpec::Single(name) => {
-      if let Some((idx, _)) =
-        tasks.iter().enumerate().find(|(_, (n, _))| n == name.as_ref())
+      if let Some((idx, _)) = tasks
+        .iter()
+        .enumerate()
+        .find(|(_, (n, _))| n == name.as_ref())
       {
         selected.push(idx);
       }
     }
     TaskSpec::Sequence(list) => {
       for item in list {
-        if let TaskSpec::Single(name) = item {
-          if let Some((idx, _)) =
-            tasks.iter().enumerate().find(|(_, (n, _))| n == name.as_ref())
-          {
-            if !selected.contains(&idx) {
-              selected.push(idx);
-            }
-          }
+        if let TaskSpec::Single(name) = item
+          && let Some((idx, _)) = tasks
+            .iter()
+            .enumerate()
+            .find(|(_, (n, _))| n == name.as_ref())
+          && !selected.contains(&idx)
+        {
+          selected.push(idx);
         }
       }
     }
@@ -322,90 +364,42 @@ fn task_spec_from_selection(
 /// Internal state for the dashboard.
 #[derive(Clone, Constructor)]
 pub struct DashboardState<'a> {
-  pub cwd:     &'a Path,
-  pub running: bool,
-  pub hooks:   Vec<(String, TaskSpec)>,
-  pub index:   usize,
-  pub tasks:   Vec<(String, TaskSpec)>,
-  pub task:    usize,
-  pub hook_state: ListState,
-  pub task_state: ListState,
-  pub logs:    Vec<LogEntry>,
-  pub prompt:  Option<Prompt>,
-  pub focus:   Focus,
-  pub scroll:  usize,
-  pub source:  String,
-  pub task_label: String,
+  pub cwd:         &'a Path,
+  pub running:     bool,
+  pub hooks:       Vec<(String, TaskSpec)>,
+  pub index:       usize,
+  pub tasks:       Vec<(String, TaskSpec)>,
+  pub task:        usize,
+  pub hook_state:  ListState,
+  pub task_state:  ListState,
+  pub logs:        Vec<LogEntry>,
+  pub prompt:      Option<Prompt>,
+  pub focus:       Focus,
+  pub scroll:      usize,
+  pub source:      String,
+  pub task_label:  String,
   pub task_source: String,
 }
 
 impl<'a> Default for DashboardState<'a> {
   fn default() -> Self {
     Self {
-      cwd:     Path::new("."),
-      running: false,
-      hooks:   vec![],
-      index:   0,
-      tasks:   vec![],
-      task:    0,
-      hook_state: ListState::default(),
-      task_state: ListState::default(),
-      logs:    vec![],
-      prompt:  None,
-      focus:   Focus::Hooks,
-      scroll:  0,
-      source:  String::new(),
-      task_label: String::new(),
+      cwd:         Path::new("."),
+      running:     false,
+      hooks:       vec![],
+      index:       0,
+      tasks:       vec![],
+      task:        0,
+      hook_state:  ListState::default(),
+      task_state:  ListState::default(),
+      logs:        vec![],
+      prompt:      None,
+      focus:       Focus::Hooks,
+      scroll:      0,
+      source:      String::new(),
+      task_label:  String::new(),
       task_source: String::new(),
     }
-  }
-}
-
-pub trait HookManager<'a>
-where
-  Self: Sized + 'a,
-{
-  fn selected_hook(&'a self) -> Option<(CowStr<'a>, &'a TaskSpec)>;
-
-  fn cwd(&self) -> &Path;
-
-  fn add_hook(
-    &mut self,
-    name: &str,
-    spec: TaskSpec,
-  ) -> Result<(), RunnerError>;
-
-  fn refresh_config(&mut self) -> Result<(), RunnerError>;
-
-  fn remove_hook(&mut self, name: &str) -> Result<(), RunnerError>;
-
-  fn run_hook(&mut self, name: &str) -> Result<(), RunnerError> {
-    self.run_hook_with(name, &[])
-  }
-
-  fn run_hook_with(
-    &mut self,
-    name: &str,
-    args: &[String],
-  ) -> Result<(), RunnerError>;
-
-  fn update_hook(
-    &mut self,
-    name: &str,
-    spec: TaskSpec,
-  ) -> Result<(), RunnerError>;
-
-  fn discover_config(&mut self) -> Result<HookConfig, RunnerError> {
-    HookConfig::discover(self.cwd()).map_err(Into::into)
-  }
-
-  fn mutate_hooks<F>(&mut self, mutator: F) -> Result<(), RunnerError>
-  where
-    F: FnOnce(&mut Map<String, Value>) -> Result<(), RunnerError>,
-  {
-    let cfg = self.discover_config()?;
-    mutate_hooks(&cfg, mutator)?;
-    self.refresh_config()
   }
 }
 
@@ -555,7 +549,7 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                 if let Some(prompt) = &self.prompt {
                   if prompt.buffer.is_empty() {
                     break;
-                  } else if self.handle_prompt_input(Enter)? {
+                  } else if self.handle_input(Enter)? {
                     continue;
                   }
                 }
@@ -623,12 +617,21 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
               Char('r') | Char('R') | F(5) => {
                 self.refresh_config()?;
               }
-              Enter => {
-                if let Some((name, _)) = self.current_hook() {
-                  let prompt = Prompt::confirm_run(name.to_string());
-                  self.set_prompt(prompt)?;
+              Enter => match self.focus {
+                Hooks => {
+                  if let Some((name, _)) = self.current_hook() {
+                    let prompt = Prompt::confirm_run(name.to_string());
+                    self.set_prompt(prompt)?;
+                  }
                 }
-              }
+                Tasks => {
+                  if let Some((name, _)) = self.current_task() {
+                    let prompt = Prompt::confirm_run_task(name.to_string());
+                    self.set_prompt(prompt)?;
+                  }
+                }
+                _ => {}
+              },
               Char('a') => {
                 let options = collect_available_hooks(&self.hooks);
                 if options.is_empty() {
@@ -641,9 +644,9 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                 }
               }
               Char('e') => {
-                let current = self.current_hook().map(|(name, spec)| {
-                  (name.clone(), spec.clone())
-                });
+                let current = self
+                  .current_hook()
+                  .map(|(name, spec)| (name.clone(), spec.clone()));
                 if let Some((name, spec)) = current {
                   if self.tasks.is_empty() {
                     self.set_prompt(Prompt::update_hook(
@@ -651,8 +654,7 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                       editable_spec(&spec),
                     ))?;
                   } else {
-                    let selected =
-                      selected_tasks_from_spec(&spec, &self.tasks);
+                    let selected = selected_tasks_from_spec(&spec, &self.tasks);
                     let next_task =
                       selected.first().copied().unwrap_or(self.task);
                     self.task = next_task;
@@ -695,7 +697,7 @@ impl Drawable for DashboardState<'_> {
       .constraints([
         Constraint::Length(3),
         Constraint::Fill(2),
-        Constraint::Min(3),
+        Constraint::Min(if f.area().height > 24 { 2 } else { 1 }),
         Constraint::Min(status_height),
       ])
       .split(f.area());
@@ -705,19 +707,27 @@ impl Drawable for DashboardState<'_> {
       .style(Style::default().add_modifier(Modifier::BOLD))
       .block(
         Block::default()
-          .borders(Borders::ALL)
+          .borders(Borders::BOTTOM)
           .border_type(BorderType::Rounded)
-          .title(format!(" huk v{VERSION} ")),
+          .title(" huk dashboard ")
+          .title(
+            Line::from(format!(" v{VERSION} "))
+              .right_aligned()
+              .style(Style::default().dim()),
+          ),
       );
     f.render_widget(header, layout[0]);
 
     // Main area: list + details (responsive columns).
     let main_area = layout[1];
-    let use_columns = main_area.width >= MIN_TWO_COLUMN_WIDTH;
+    let use_columns = main_area.width >= constants::MIN_TWO_COLUMN_WIDTH;
     let constraints = if use_columns {
       [Constraint::Percentage(50), Constraint::Percentage(50)]
     } else {
-      [Constraint::Min(MIN_PANEL_HEIGHT), Constraint::Min(MIN_PANEL_HEIGHT)]
+      [
+        Constraint::Min(constants::MIN_PANEL_HEIGHT),
+        Constraint::Min(constants::MIN_PANEL_HEIGHT),
+      ]
     };
     let main = Layout::default()
       .direction(if use_columns {
@@ -844,14 +854,15 @@ impl Drawable for DashboardState<'_> {
 
     // Tasks + details.
     let mut task_picker_selection: Vec<usize> = Vec::new();
-    let is_task_picker = if let Some(PromptKind::PickTask { selections, .. }) =
-      self.prompt.as_ref().map(|p| &p.kind)
-    {
-      task_picker_selection = selections.clone();
-      true
-    } else {
-      false
-    };
+    let is_task_picker =
+      if let Some(PromptKind::PickTask { selections, .. }) =
+        self.prompt.as_ref().map(|p| &p.kind)
+      {
+        task_picker_selection = selections.clone();
+        true
+      } else {
+        false
+      };
     let task_items: Vec<ListItem> = self
       .tasks
       .iter()
@@ -1007,223 +1018,6 @@ impl Drawable for DashboardState<'_> {
 
 impl<'a> InputHandler for DashboardState<'a> {
   fn handle_input(&mut self, code: KeyCode) -> Result<bool, RunnerError> {
-    self.handle_prompt_input(code)
-  }
-}
-
-impl<'a> MouseHandler for DashboardState<'a> {
-  fn handle_mouse(&mut self, event: MouseEvent) {
-    self.handle_mouse_event(event);
-  }
-}
-
-impl<'a> DashboardState<'a> {
-  pub fn from_cwd(cwd: &'a Path) -> Self {
-    Self {
-      cwd,
-      ..Self::default()
-    }
-  }
-
-  pub fn from_config(cfg: &'a HookConfig) -> Self {
-    let mut hooks: Vec<(String, TaskSpec)> = cfg
-      .hooks
-      .iter()
-      .map(|(name, spec)| (name.clone(), spec.clone()))
-      .collect();
-    hooks.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let cwd = cfg.source.as_path().parent().unwrap_or(Path::new("."));
-    let tasks = cfg
-      .tasks()
-      .into_iter()
-      .map(|(name, spec)| (name.to_string(), spec))
-      .collect();
-    Self {
-      cwd,
-      hooks,
-      index: 0,
-      tasks,
-      task: 0,
-      hook_state: ListState::default(),
-      task_state: ListState::default(),
-      running: false,
-      logs: Vec::new(),
-      prompt: None,
-      focus: Focus::Hooks,
-      scroll: 0,
-      source: cfg.source.as_str().to_string(),
-      task_label: task_source_label(cfg),
-      task_source: cfg.source.file_name().to_string(),
-    }
-  }
-}
-
-impl<'a> DashboardState<'a> {
-  pub fn apply_config(&mut self, cfg: &HookConfig) {
-    let mut hooks: Vec<(String, TaskSpec)> = cfg
-      .hooks
-      .iter()
-      .map(|(name, spec)| (name.clone(), spec.clone()))
-      .collect();
-    hooks.sort_by(|a, b| a.0.cmp(&b.0));
-    self.hooks = hooks;
-    if self.index >= self.hooks.len() && !self.hooks.is_empty() {
-      self.index = self.hooks.len() - 1;
-    }
-    self.tasks = cfg
-      .tasks()
-      .into_iter()
-      .map(|(name, spec)| (name.to_string(), spec))
-      .collect();
-    if self.task >= self.tasks.len() && !self.tasks.is_empty() {
-      self.task = self.tasks.len() - 1;
-    }
-    self.source = cfg.source.as_str().to_string();
-    self.task_label = task_source_label(cfg);
-    self.task_source = cfg.source.file_name().to_string();
-  }
-
-  pub fn current_hook(&self) -> Option<(&String, &TaskSpec)> {
-    self.hooks.get(self.index).map(|(name, spec)| (name, spec))
-  }
-
-  pub fn current_task(&self) -> Option<(&String, &TaskSpec)> {
-    self.tasks.get(self.task).map(|(name, spec)| (name, spec))
-  }
-
-  pub fn move_selection_up(&mut self) {
-    self.index = self.index.saturating_sub(1);
-  }
-
-  pub fn move_selection_down(&mut self) {
-    if self.index + 1 < self.hooks.len() {
-      self.index += 1;
-    }
-  }
-
-  pub fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
-    self.logs.push(LogEntry {
-      level,
-      message: message.into(),
-      timestamp: chrono::Local::now(),
-    });
-    if self.scroll > 0 {
-      self.scroll += 1;
-    }
-    if self.logs.len() > LOG_LIMIT {
-      let excess = self.logs.len() - LOG_LIMIT;
-      self.logs.drain(0..excess);
-      self.normalize_scroll();
-    }
-  }
-
-  pub fn append_output(&mut self, chunks: Vec<OutputChunk>) {
-    for chunk in chunks {
-      match chunk {
-        OutputChunk::Stdout(s) => {
-          self.push_log(LogLevel::Stdout, s.replace('\r', "\n"))
-        }
-        OutputChunk::Stderr(s) => {
-          self.push_log(LogLevel::Stderr, s.replace('\r', "\n"))
-        }
-      }
-    }
-  }
-
-  pub fn select_hook(&mut self, name: &str) {
-    if let Some((idx, _)) =
-      self.hooks.iter().enumerate().find(|(_, (n, _))| n == name)
-    {
-      self.index = idx;
-    }
-  }
-
-  pub fn set_prompt(&mut self, prompt: Prompt) -> HukResult<()> {
-    if prompt.needs_cursor() {
-      self.show_cursor()?;
-    } else {
-      self.hide_cursor()?;
-    }
-    self.prompt = Some(prompt);
-    Ok(())
-  }
-
-  pub fn clear_prompt(&mut self) -> HukResult<()> {
-    self.prompt = None;
-    self.hide_cursor()?;
-    Ok(())
-  }
-
-  pub fn scroll_logs(&mut self, delta: isize) {
-    if self.logs.is_empty() {
-      self.scroll_to_log_end();
-      return;
-    }
-    let max = self.logs.len().saturating_sub(1);
-    if delta.is_negative() {
-      let amount = delta.wrapping_abs() as usize;
-      self.scroll = self.scroll.saturating_sub(amount);
-    } else {
-      let amount = delta as usize;
-      self.scroll = (self.scroll + amount).min(max);
-    }
-  }
-
-  pub fn scroll_to_log_start(&mut self) {
-    if self.logs.is_empty() {
-      self.scroll_to_log_end();
-    } else {
-      self.scroll = self.logs.len().saturating_sub(1);
-    }
-  }
-
-  pub fn scroll_to_log_end(&mut self) {
-    self.scroll = 0;
-  }
-
-  pub fn normalize_scroll(&mut self) {
-    if self.logs.is_empty() {
-      self.scroll_to_log_end();
-      return;
-    }
-    let max = self.logs.len().saturating_sub(1);
-    if self.scroll > max {
-      self.scroll = max;
-    }
-  }
-
-  pub fn status_height(&self, width: u16) -> u16 {
-    if let Some(prompt) = &self.prompt {
-      let inner_width = width.saturating_sub(2).max(1);
-      let height = prompt.visual_height(inner_width);
-      height.max(3).min(10)
-    } else {
-      3
-    }
-  }
-
-  fn handle_mouse_event(&mut self, event: MouseEvent) {
-    let mut delta = match event.kind {
-      MouseEventKind::ScrollUp => 1,
-      MouseEventKind::ScrollDown => -1,
-      _ => 0,
-    };
-    use KeyModifiers as KM;
-    if event.modifiers.contains(KM::ALT) || event.modifiers.contains(KM::META) {
-      delta *= 3;
-    }
-    if event.modifiers.contains(KM::SHIFT) {
-      delta *= 2;
-    }
-    self.focus = Focus::Output;
-    self.scroll_logs(delta);
-  }
-
-  fn handle_prompt_input(
-    &mut self,
-    code: KeyCode,
-  ) -> Result<bool, RunnerError> {
     if self.prompt.is_none() {
       self.hide_cursor()?;
       return Ok(false);
@@ -1241,6 +1035,18 @@ impl<'a> DashboardState<'a> {
       PromptKind::ConfirmRun(name) => match code {
         Char('y') | Enter => {
           if let Err(err) = self.run_hook(&name) {
+            self.push_log(LogLevel::Error, format!("{err}"));
+          }
+        }
+        Char('n') | Char('\x04') | Char('\x03') | Esc => {}
+        _ => {
+          self.set_prompt(prompt)?;
+          return Ok(true);
+        }
+      },
+      PromptKind::ConfirmRunTask(name) => match code {
+        Char('y') | Enter => {
+          if let Err(err) = self.run_task(&name) {
             self.push_log(LogLevel::Error, format!("{err}"));
           }
         }
@@ -1305,9 +1111,7 @@ impl<'a> DashboardState<'a> {
       },
       PromptKind::PickHook { options, mut index } => match code {
         Up => {
-          if index > 0 {
-            index -= 1;
-          }
+          index = index.saturating_sub(1);
           self.set_prompt(Prompt {
             kind: PromptKind::PickHook { options, index },
             ..prompt
@@ -1329,6 +1133,7 @@ impl<'a> DashboardState<'a> {
             if self.tasks.is_empty() {
               self.set_prompt(Prompt::add_hook_spec(name))?;
             } else {
+              self.task = 0;
               self.set_prompt(Prompt::pick_task(
                 name,
                 SpecEditMode::Add,
@@ -1352,24 +1157,6 @@ impl<'a> DashboardState<'a> {
         }
       },
       PromptKind::AddSpec { hook } => match code {
-        F(2) => {
-          if self.tasks.is_empty() {
-            self.push_log(
-              LogLevel::Error,
-              "No tasks/scripts available to select.",
-            );
-            self.set_prompt(prompt)?;
-            return Ok(true);
-          }
-          let fallback = prompt.buffer.clone();
-          self.set_prompt(Prompt::pick_task(
-            hook,
-            SpecEditMode::Add,
-            fallback,
-            Vec::new(),
-          ))?;
-          return Ok(true);
-        }
         Enter => {
           if prompt.buffer.trim().is_empty() {
             self
@@ -1401,24 +1188,6 @@ impl<'a> DashboardState<'a> {
         }
       },
       PromptKind::Update { hook } => match code {
-        F(2) => {
-          if self.tasks.is_empty() {
-            self.push_log(
-              LogLevel::Error,
-              "No tasks/scripts available to select.",
-            );
-            self.set_prompt(prompt)?;
-            return Ok(true);
-          }
-          let fallback = prompt.buffer.clone();
-          self.set_prompt(Prompt::pick_task(
-            hook,
-            SpecEditMode::Update,
-            fallback,
-            Vec::new(),
-          ))?;
-          return Ok(true);
-        }
         Enter => {
           if prompt.buffer.trim().is_empty() {
             self
@@ -1457,9 +1226,7 @@ impl<'a> DashboardState<'a> {
         mut index,
       } => match code {
         Up => {
-          if index > 0 {
-            index -= 1;
-          }
+          index = index.saturating_sub(1);
           self.task = index;
           self.set_prompt(Prompt {
             kind: PromptKind::PickTask {
@@ -1541,8 +1308,7 @@ impl<'a> DashboardState<'a> {
             })?;
             return Ok(true);
           }
-          if let Some(spec) =
-            task_spec_from_selection(&selections, &self.tasks)
+          if let Some(spec) = task_spec_from_selection(&selections, &self.tasks)
           {
             let result = match mode {
               SpecEditMode::Add => self.add_hook(&hook, spec),
@@ -1551,10 +1317,7 @@ impl<'a> DashboardState<'a> {
             if let Err(err) = result {
               self.push_log(LogLevel::Error, format!("{err}"));
               self.set_prompt(Prompt::pick_task(
-                hook,
-                mode,
-                fallback,
-                selections,
+                hook, mode, fallback, selections,
               ))?;
               return Ok(true);
             }
@@ -1574,6 +1337,272 @@ impl<'a> DashboardState<'a> {
     }
 
     Ok(true)
+  }
+}
+
+impl<'a> MouseHandler for DashboardState<'a> {
+  fn handle_mouse(&mut self, event: MouseEvent) {
+    let mut delta = match event.kind {
+      MouseEventKind::ScrollUp => 1,
+      MouseEventKind::ScrollDown => -1,
+      _ => 0,
+    };
+    use KeyModifiers as KM;
+    if event.modifiers.contains(KM::ALT) || event.modifiers.contains(KM::META) {
+      delta *= constants::FAST_SCROLL_MULTIPLIER as isize;
+    } else {
+      delta *= constants::BASE_SCROLL_DELTA as isize;
+    }
+    self.scroll(delta);
+  }
+}
+
+impl<'a> DashboardState<'a> {
+  pub fn from_cwd(cwd: &'a Path) -> Self {
+    Self {
+      cwd,
+      ..Self::default()
+    }
+  }
+
+  pub fn from_config(cfg: &'a HookConfig) -> Self {
+    let mut hooks: Vec<(String, TaskSpec)> = cfg
+      .hooks
+      .iter()
+      .map(|(name, spec)| (name.clone(), spec.clone()))
+      .collect();
+    hooks.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let cwd = cfg.source.as_path().parent().unwrap_or(Path::new("."));
+    let tasks = cfg
+      .tasks()
+      .into_iter()
+      .map(|(name, spec)| (name.to_string(), spec))
+      .collect();
+    Self {
+      cwd,
+      hooks,
+      index: 0,
+      tasks,
+      task: 0,
+      hook_state: ListState::default(),
+      task_state: ListState::default(),
+      running: false,
+      logs: Vec::new(),
+      prompt: None,
+      focus: Focus::Hooks,
+      scroll: 0,
+      source: cfg.source.as_str().to_string(),
+      task_label: task_source_label(cfg),
+      task_source: cfg.source.file_name().to_string(),
+    }
+  }
+}
+
+impl<'a> DashboardState<'a> {
+  pub fn apply_config(&mut self, cfg: &HookConfig) {
+    let mut hooks: Vec<(String, TaskSpec)> = cfg
+      .hooks
+      .iter()
+      .map(|(name, spec)| (name.clone(), spec.clone()))
+      .collect();
+    hooks.sort_by(|a, b| a.0.cmp(&b.0));
+    self.hooks = hooks;
+    if self.index >= self.hooks.len() && !self.hooks.is_empty() {
+      self.index = self.hooks.len() - 1;
+    }
+    self.tasks = cfg
+      .tasks()
+      .into_iter()
+      .map(|(name, spec)| (name.to_string(), spec))
+      .collect();
+    if self.task >= self.tasks.len() && !self.tasks.is_empty() {
+      self.task = self.tasks.len() - 1;
+    }
+    self.source = cfg.source.as_str().to_string();
+    self.task_label = task_source_label(cfg);
+    self.task_source = cfg.source.file_name().to_string();
+  }
+
+  pub fn current_hook(&self) -> Option<(&String, &TaskSpec)> {
+    self.hooks.get(self.index).map(|(name, spec)| (name, spec))
+  }
+
+  pub fn current_task(&self) -> Option<(&String, &TaskSpec)> {
+    self.tasks.get(self.task).map(|(name, spec)| (name, spec))
+  }
+
+  pub fn run_task(&mut self, task: &str) -> Result<(), RunnerError> {
+    let cfg = HookConfig::discover(self.cwd)?;
+    self.apply_config(&cfg);
+    let mut runner = TaskRunner::new_with_capture(&cfg);
+
+    self.running = true;
+    self.push_log(LogLevel::Info, format!("Running task '{task}'..."));
+    let result = runner.run_named_task(task);
+    self.running = false;
+
+    let output = runner.take_output();
+    self.append_output(output);
+
+    if let Err(err) = result {
+      self.push_log(LogLevel::Error, format!("{err}"));
+    } else {
+      self.push_log(LogLevel::Success, format!("Task '{task}' finished."));
+    }
+    Ok(())
+  }
+
+  pub fn move_selection_up(&mut self) {
+    self.index = self.index.saturating_sub(1);
+  }
+
+  pub fn move_selection_down(&mut self) {
+    if self.index + 1 < self.hooks.len() {
+      self.index += 1;
+    }
+  }
+
+  pub fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
+    self.logs.push(LogEntry {
+      level,
+      message: message.into(),
+      timestamp: chrono::Local::now(),
+    });
+    if self.scroll > 0 {
+      self.scroll += 1;
+    }
+    if self.logs.len() > constants::LOG_LIMIT {
+      let excess = self.logs.len() - constants::LOG_LIMIT;
+      self.logs.drain(0..excess);
+      self.normalize_scroll();
+    }
+  }
+
+  pub fn append_output(&mut self, chunks: Vec<OutputChunk>) {
+    for chunk in chunks {
+      match chunk {
+        OutputChunk::Stdout(s) => self.push_log(
+          LogLevel::Stdout,
+          s.replace("\r\n", "\n").replace('\r', "\n"),
+        ),
+        OutputChunk::Stderr(s) => self.push_log(
+          LogLevel::Stderr,
+          s.replace("\r\n", "\n").replace('\r', "\n"),
+        ),
+      }
+    }
+  }
+
+  pub fn select_hook(&mut self, name: &str) {
+    if let Some((idx, _)) =
+      self.hooks.iter().enumerate().find(|(_, (n, _))| n == name)
+    {
+      self.index = idx;
+    }
+  }
+
+  pub fn set_prompt(&mut self, prompt: Prompt) -> HukResult<()> {
+    if prompt.needs_cursor() {
+      self.show_cursor()?;
+    } else {
+      self.hide_cursor()?;
+    }
+    self.prompt = Some(prompt);
+    Ok(())
+  }
+
+  pub fn clear_prompt(&mut self) -> HukResult<()> {
+    self.prompt = None;
+    self.hide_cursor()?;
+    Ok(())
+  }
+
+  /// Scroll the currently focused region by [`delta`] lines.
+  pub fn scroll(&mut self, delta: isize) {
+    use Focus::*;
+
+    if matches!(self.focus, Hooks | Tasks) {
+      let (list, offset) = if self.focus == Hooks {
+        (&mut self.hook_state, &mut self.index)
+      } else {
+        (&mut self.task_state, &mut self.task)
+      };
+
+      if delta < 0 {
+        list.scroll_up_by(delta.abs() as u16);
+      } else if delta > 0 {
+        list.scroll_down_by(delta.abs() as u16);
+      }
+      *offset = list.offset();
+    } else if self.focus == Output {
+      self.scroll_logs(delta);
+    }
+  }
+
+  pub fn scroll_to(&mut self, offset: usize) {
+    use Focus::*;
+
+    match self.focus {
+      Hooks => {
+        *self.hook_state.selected_mut() = Some(offset);
+      }
+      Tasks => {
+        *self.task_state.selected_mut() = Some(offset);
+      }
+      Output => {
+        self.scroll = offset;
+      }
+      _ => {}
+    }
+  }
+
+  pub fn scroll_logs(&mut self, delta: isize) {
+    if self.logs.is_empty() {
+      self.scroll_to_log_end();
+      return;
+    }
+    let max = self.logs.len().saturating_sub(1);
+    if delta.is_negative() {
+      let amount = delta.wrapping_abs() as usize;
+      self.scroll = self.scroll.saturating_sub(amount);
+    } else {
+      let amount = delta as usize;
+      self.scroll = (self.scroll + amount).min(max);
+    }
+  }
+
+  pub fn scroll_to_log_start(&mut self) {
+    if self.logs.is_empty() {
+      self.scroll_to_log_end();
+    } else {
+      self.scroll = self.logs.len().saturating_sub(1);
+    }
+  }
+
+  pub fn scroll_to_log_end(&mut self) {
+    self.scroll = 0;
+  }
+
+  pub fn normalize_scroll(&mut self) {
+    if self.logs.is_empty() {
+      self.scroll_to_log_end();
+      return;
+    }
+    let max = self.logs.len().saturating_sub(1);
+    if self.scroll > max {
+      self.scroll = max;
+    }
+  }
+
+  pub fn status_height(&self, width: u16) -> u16 {
+    if let Some(prompt) = &self.prompt {
+      let inner_width = width.saturating_sub(2).max(1);
+      let height = prompt.visual_height(inner_width);
+      height.max(3).min(10)
+    } else {
+      3
+    }
   }
 }
 
@@ -1612,11 +1641,20 @@ impl Default for Prompt {
     }
   }
 }
+
 impl Prompt {
   pub fn confirm_run(name: String) -> Self {
     Self {
       kind: PromptKind::ConfirmRun(name.clone()),
       label: format!("Run hook '{name}'? (y/n)"),
+      ..Default::default()
+    }
+  }
+
+  pub fn confirm_run_task(name: String) -> Self {
+    Self {
+      kind: PromptKind::ConfirmRunTask(name.clone()),
+      label: format!("Run task '{name}'? (y/n)"),
       ..Default::default()
     }
   }
@@ -1689,10 +1727,7 @@ impl Prompt {
 
   pub fn pick_hook(options: Vec<String>) -> Self {
     Self {
-      kind: PromptKind::PickHook {
-        options,
-        index: 0,
-      },
+      kind: PromptKind::PickHook { options, index: 0 },
       label: "Select hook to add (↑↓ move, Enter confirm)".into(),
       ..Default::default()
     }
@@ -1711,20 +1746,25 @@ impl Prompt {
 #[derive(Clone)]
 pub enum PromptKind {
   ConfirmRun(String),
+  ConfirmRunTask(String),
   ConfirmRemove(String),
   AddName,
-  AddSpec { hook: String },
-  Update { hook: String },
+  AddSpec {
+    hook: String,
+  },
+  Update {
+    hook: String,
+  },
   PickHook {
     options: Vec<String>,
     index:   usize,
   },
   PickTask {
-    hook:     String,
-    mode:     SpecEditMode,
-    fallback: String,
+    hook:       String,
+    mode:       SpecEditMode,
+    fallback:   String,
     selections: Vec<usize>,
-    index: usize,
+    index:      usize,
   },
 }
 
