@@ -579,8 +579,8 @@ impl<'cfg> TaskRunner<'cfg> {
           self.run_named_task(dep.as_ref())?;
         }
 
-        if let Some(cmd) = command {
-          self.exec_raw_command(cmd.as_ref(), extra_args)
+        if let Some(cmd) = command.as_deref() {
+          self.exec_raw_command(cmd, extra_args)
         } else {
           // Only dependencies defined; nothing else to do.
           Ok(())
@@ -607,8 +607,8 @@ impl<'cfg> TaskRunner<'cfg> {
     self.visiting.insert(name.to_string());
     let result = if self.config.deno_tasks.get(name).is_some() {
       self.exec_deno_task(name, extra_args)
-    } else if let Some(script) = self.config.node_scripts.get(name) {
-      self.exec_node_script(name, script, extra_args)
+    } else if self.config.node_scripts.get(name).is_some() {
+      self.exec_node_script(name, extra_args)
     } else if let Some(spec) = self.config.hooks.get(name) {
       self.run_spec(spec, name, extra_args)
     } else {
@@ -684,7 +684,6 @@ impl<'cfg> TaskRunner<'cfg> {
   pub(crate) fn exec_node_script(
     &mut self,
     name: &str,
-    _script: &CowStr<'static>,
     extra_args: &[String],
   ) -> Result<(), RunnerError> {
     // Determine the package manager. Parses e.g. "pnpm@7.1.2" into "pnpm"
@@ -732,19 +731,13 @@ impl<'cfg> TaskRunner<'cfg> {
 
       if !output.stdout.is_empty() {
         buf.push(OutputChunk::Stdout(
-          String::from_utf8_lossy(unsafe {
-            ::core::mem::transmute_copy(&output.stdout)
-          })
-          .into(),
+          String::from_utf8_lossy(&output.stdout).to_string().into(),
         ));
       }
 
       if !output.stderr.is_empty() {
         buf.push(OutputChunk::Stderr(
-          String::from_utf8_lossy(unsafe {
-            ::core::mem::transmute_copy(&output.stderr)
-          })
-          .into(),
+          String::from_utf8_lossy(&output.stderr).to_string().into(),
         ));
       }
       if output.status.success() {

@@ -4,11 +4,14 @@
 //! the `huk` executable exposes. It uses the [`clap`](https://crates.io/crates/clap)
 //! crate for ergonomic argument parsing.
 
+use std::path::PathBuf;
+
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use derive_more::with_trait::IsVariant;
 use derive_more::with_trait::TryInto;
+use lazy_static::lazy_static;
 use paste::paste;
 use thiserror::Error;
 
@@ -44,6 +47,10 @@ pub struct Cli {
   /// Subcommand to execute.
   #[command(subcommand)]
   pub command: Commands,
+}
+
+lazy_static! {
+  static ref LAZY_CWD: PathBuf = std::env::current_dir().unwrap_or_default();
 }
 
 macro_rules! cli {
@@ -155,7 +162,12 @@ cli! {
        ←|→ (left / right)\n    \
            Reposition the cursor in text fields.\n")]
   #[cfg(feature = "tui")]
-  Dashboard(Default),
+  Dashboard(Default) {
+    /// Set the working directory to run the huk dashboard in.
+    ///
+    /// Defaults to the current working directory.
+    cwd(long, short = 'C', default_value = LAZY_CWD.to_str()): Option<PathBuf>,
+  },
   /// List configured Git hooks and associated tasks.
   #[command(
     aliases = ["ls", "l", "hooks"],
@@ -174,12 +186,12 @@ cli! {
     name_only(long, short = 'n'): bool,
     /// Format results as JSON (JavaScript Object Notation).
     json(long, short = 'j'): bool,
-    /// Formatbbresults as YAML (YAML Ain't Markup Language).
+    /// Format results as YAML (YAML Ain't Markup Language).
     yaml(long, short = 'y', long_help = "Format results as YAML (YAML \
     Ain't Markup Language).\n\nNote: this currently ignores the --compact flag."): bool,
     /// Format results as TOML (Tom's Obvious, Minimal Language).
     toml(long, short = 't'): bool,
-    /// Outputs a static list of names of all Git hooks that `huk` supports.
+    /// Output a static list of names of all Git hooks that `huk` supports.
     all(
       long,
       short = 'a',

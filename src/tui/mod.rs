@@ -1530,9 +1530,9 @@ impl<'a> DashboardState<'a> {
       };
 
       if delta < 0 {
-        list.scroll_up_by(delta.abs() as u16);
+        list.scroll_up_by(delta.unsigned_abs() as u16);
       } else if delta > 0 {
-        list.scroll_down_by(delta.abs() as u16);
+        list.scroll_down_by(delta.unsigned_abs() as u16);
       }
       *offset = list.offset();
     } else if self.focus == Output {

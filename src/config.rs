@@ -307,12 +307,13 @@ impl HookConfig {
     if let Value::Object(map) = value
       && let Some(deps_value) =
         map.get("dependencies").or_else(|| map.get("depends"))
-        && !matches!(deps_value, Value::Array(_)) {
-          return Err(ConfigError::InvalidTask(
-            name.to_string(),
-            "dependencies must be an array of strings".into(),
-          ));
-        }
+      && !matches!(deps_value, Value::Array(_))
+    {
+      return Err(ConfigError::InvalidTask(
+        name.to_string(),
+        "dependencies must be an array of strings".into(),
+      ));
+    }
     TaskSpec::from_json(value).map_err(|err| {
       ConfigError::InvalidTask(name.to_string(), err.to_string())
     })
