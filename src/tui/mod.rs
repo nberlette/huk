@@ -28,7 +28,6 @@ use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
-use derive_more::with_trait::Constructor;
 use moos::CowStr;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -364,8 +363,7 @@ fn task_spec_from_selection(
 }
 
 /// Internal state for the dashboard.
-#[allow(clippy::too_many_arguments)]
-#[derive(Clone, Constructor)]
+#[derive(Clone)]
 pub struct DashboardState<'a> {
   pub cwd:           &'a Path,
   pub running:       bool,
@@ -740,10 +738,9 @@ impl Drawable for DashboardState<'_> {
         constants::DEFAULT_OUTPUT_HEIGHT
       };
       let available_output_height = remaining_height.saturating_sub(1);
-      if available_output_height >= constants::MIN_OUTPUT_HEIGHT {
+      if available_output_height >= constants::MINIMUM_OUTPUT_HEIGHT {
         output_height = desired_output_height
-          .max(constants::MIN_OUTPUT_HEIGHT)
-          .min(available_output_height);
+          .clamp(constants::MINIMUM_OUTPUT_HEIGHT, available_output_height);
         remaining_height = remaining_height.saturating_sub(output_height);
       }
     }
@@ -801,7 +798,7 @@ impl Drawable for DashboardState<'_> {
     }
 
     // Main area: list + details (responsive columns).
-    let use_columns = main_area.width >= constants::COLUMN_LAYOUT_THRESHOLD
+    let use_columns = main_area.width >= constants::COMPACT_VIEWPORT_WIDTH
       || main_area.height < constants::MINIMUM_PANEL_HEIGHT.saturating_mul(2);
     let constraints = if use_columns {
       [Constraint::Percentage(50), Constraint::Percentage(50)]
@@ -1485,7 +1482,7 @@ impl<'a> DashboardState<'a> {
 
   fn compact_viewport(viewport: Rect) -> bool {
     viewport.height <= constants::COMPACT_VIEWPORT_HEIGHT
-      || viewport.width < constants::COLUMN_LAYOUT_THRESHOLD
+      || viewport.width <= constants::COMPACT_VIEWPORT_WIDTH
   }
 
   fn cycle_focus(&mut self, forward: bool) {
@@ -2153,13 +2150,13 @@ impl PromptCursor for Prompt {
 pub enum LogLevel {
   #[display("info")]
   Info,
-  #[display("success")]
+  #[display("okay")]
   Success,
-  #[display("stdout")]
+  #[display("out1")]
   Stdout,
-  #[display("stderr")]
+  #[display("err2")]
   Stderr,
-  #[display("error")]
+  #[display("fail")]
   Error,
 }
 
