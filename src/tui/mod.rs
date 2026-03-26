@@ -12,6 +12,9 @@ use std::io::{self};
 use std::path::Path;
 use std::time::Duration;
 
+use ::derive_more::Debug;
+use ::derive_more::Display;
+use ::derive_more::IsVariant;
 use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
@@ -33,7 +36,6 @@ use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
-use ratatui::prelude::Stylize;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -270,16 +272,16 @@ fn task_source_label(cfg: &HookConfig) -> String {
 }
 
 fn split_list_detail(area: Rect) -> (Rect, Rect) {
-  let min_total =
-    constants::MIN_LIST_HEIGHT.saturating_add(constants::MIN_DETAIL_HEIGHT);
+  let min_total = constants::MINIMUM_LIST_HEIGHT
+    .saturating_add(constants::MINIMUM_DETAIL_HEIGHT);
   let mut list_height = ((area.height as f32) * 0.35).round() as u16;
 
   if area.height <= min_total {
     list_height = area.height / 2;
   } else {
     list_height = list_height
-      .max(constants::MIN_LIST_HEIGHT)
-      .min(area.height.saturating_sub(constants::MIN_DETAIL_HEIGHT));
+      .max(constants::MINIMUM_LIST_HEIGHT)
+      .min(area.height.saturating_sub(constants::MINIMUM_DETAIL_HEIGHT));
   }
 
   let detail_height = area.height.saturating_sub(list_height);
@@ -362,43 +364,44 @@ fn task_spec_from_selection(
 }
 
 /// Internal state for the dashboard.
+#[allow(clippy::too_many_arguments)]
 #[derive(Clone, Constructor)]
 pub struct DashboardState<'a> {
-  pub cwd:         &'a Path,
-  pub running:     bool,
-  pub hooks:       Vec<(String, TaskSpec)>,
-  pub index:       usize,
-  pub tasks:       Vec<(String, TaskSpec)>,
-  pub task:        usize,
-  pub hook_state:  ListState,
-  pub task_state:  ListState,
-  pub logs:        Vec<LogEntry>,
-  pub prompt:      Option<Prompt>,
-  pub focus:       Focus,
-  pub scroll:      usize,
-  pub source:      String,
-  pub task_label:  String,
-  pub task_source: String,
+  pub cwd:           &'a Path,
+  pub running:       bool,
+  pub hooks:         Vec<(String, TaskSpec)>,
+  pub selected_hook: usize,
+  pub tasks:         Vec<(String, TaskSpec)>,
+  pub selected_task: usize,
+  pub hook_state:    ListState,
+  pub task_state:    ListState,
+  pub logs:          Vec<LogEntry>,
+  pub prompt:        Option<Prompt>,
+  pub focus:         Focus,
+  pub scroll:        usize,
+  pub source:        String,
+  pub task_label:    String,
+  pub task_source:   String,
 }
 
 impl<'a> Default for DashboardState<'a> {
   fn default() -> Self {
     Self {
-      cwd:         Path::new("."),
-      running:     false,
-      hooks:       vec![],
-      index:       0,
-      tasks:       vec![],
-      task:        0,
-      hook_state:  ListState::default(),
-      task_state:  ListState::default(),
-      logs:        vec![],
-      prompt:      None,
-      focus:       Focus::Hooks,
-      scroll:      0,
-      source:      String::new(),
-      task_label:  String::new(),
-      task_source: String::new(),
+      cwd:           Path::new("."),
+      running:       false,
+      hooks:         vec![],
+      selected_hook: 0,
+      tasks:         vec![],
+      selected_task: 0,
+      hook_state:    ListState::default(),
+      task_state:    ListState::default(),
+      logs:          vec![],
+      prompt:        None,
+      focus:         Focus::Hooks,
+      scroll:        0,
+      source:        String::new(),
+      task_label:    String::new(),
+      task_source:   String::new(),
     }
   }
 }
@@ -409,12 +412,10 @@ impl<'a> HookManager<'a> for DashboardState<'a> {
   }
 
   fn selected_hook(&'a self) -> Option<(CowStr<'a>, &'a TaskSpec)> {
-    self.hooks.get(self.index).map(|(name, spec)| {
-      (
-        CowStr::try_from(name.as_str()).unwrap_or_else(|_| CowStr::from("")),
-        spec,
-      )
-    })
+    self
+      .hooks
+      .get(self.selected_hook)
+      .map(|(name, spec)| (CowStr::from(name.as_str()), spec))
   }
 
   fn add_hook(
@@ -554,33 +555,39 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                   }
                 }
               }
-              Tab => self.focus = self.focus.next(),
-              BackTab => self.focus = self.focus.prev(),
+              Tab => self.cycle_focus(true),
+              BackTab => self.cycle_focus(false),
               Up => match self.focus {
                 Hooks => self.move_selection_up(),
-                Tasks => self.task = self.task.saturating_sub(1),
+                Tasks => {
+                  self.selected_task = self.selected_task.saturating_sub(1)
+                }
                 Output => self.scroll_logs(1),
                 Input => self.prompt.iter_mut().for_each(|p| p.move_up()),
               },
               Down => match self.focus {
                 Hooks => self.move_selection_down(),
                 Tasks => {
-                  if self.task < self.tasks.len().saturating_sub(1) {
-                    self.task += 1;
+                  if self.selected_task < self.tasks.len().saturating_sub(1) {
+                    self.selected_task += 1;
                   }
                 }
                 Output => self.scroll_logs(-1),
                 Input => self.prompt.iter_mut().for_each(|p| p.move_down()),
               },
               Home => match self.focus {
-                Hooks => self.index = 0,
-                Tasks => self.task = 0,
+                Hooks => self.selected_hook = 0,
+                Tasks => self.selected_task = 0,
                 Output => self.scroll_to_log_start(),
                 Input => self.prompt.iter_mut().for_each(|p| p.move_home()),
               },
               End => match self.focus {
-                Hooks => self.index = self.hooks.len().saturating_sub(1),
-                Tasks => self.task = self.tasks.len().saturating_sub(1),
+                Hooks => {
+                  self.selected_hook = self.hooks.len().saturating_sub(1)
+                }
+                Tasks => {
+                  self.selected_task = self.tasks.len().saturating_sub(1)
+                }
                 Output => self.scroll_to_log_end(),
                 Input => self.prompt.iter_mut().for_each(|p| p.move_end()),
               },
@@ -592,7 +599,7 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                 }
                 Tasks => {
                   for _ in 0..3 {
-                    self.task = self.task.saturating_sub(1);
+                    self.selected_task = self.selected_task.saturating_sub(1);
                   }
                 }
                 Output => self.scroll_logs(self.status_height(0) as isize),
@@ -606,8 +613,8 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                 }
                 Tasks => {
                   for _ in 0..3 {
-                    if self.task < self.tasks.len().saturating_sub(1) {
-                      self.task += 1;
+                    if self.selected_task < self.tasks.len().saturating_sub(1) {
+                      self.selected_task += 1;
                     }
                   }
                 }
@@ -656,8 +663,8 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
                   } else {
                     let selected = selected_tasks_from_spec(&spec, &self.tasks);
                     let next_task =
-                      selected.first().copied().unwrap_or(self.task);
-                    self.task = next_task;
+                      selected.first().copied().unwrap_or(self.selected_task);
+                    self.selected_task = next_task;
                     self.set_prompt(Prompt::pick_task(
                       name,
                       SpecEditMode::Update,
@@ -690,43 +697,118 @@ impl<'a> Runnable<'a> for DashboardState<'a> {
 
 impl Drawable for DashboardState<'_> {
   fn draw(&mut self, f: &mut ratatui::Frame<'_>) {
-    let status_height = self.status_height(f.area().width);
+    let viewport = f.area();
+    let compact_viewport = Self::compact_viewport(viewport);
+    let panel_padding = if compact_viewport {
+      constants::COMPACT_PANEL_PADDING
+    } else {
+      constants::DEFAULT_PANEL_PADDING
+    };
+    let show_header = !compact_viewport;
+    let show_output = self.output_panel_visible();
+
+    if !show_output && self.focus == Focus::Output {
+      self.focus = Focus::Tasks;
+    }
+
+    let mut remaining_height = viewport.height;
+    let header_height = if show_header {
+      remaining_height.min(constants::HEADER_HEIGHT)
+    } else {
+      0
+    };
+    remaining_height = remaining_height.saturating_sub(header_height);
+
+    let desired_status_height = if compact_viewport {
+      constants::COMPACT_PROMPT_HEIGHT
+    } else {
+      self.status_height(viewport.width)
+    };
+    let status_height_cap = if remaining_height > 0 {
+      remaining_height.saturating_sub(1).max(1)
+    } else {
+      0
+    };
+    let status_height = desired_status_height.min(status_height_cap);
+    remaining_height = remaining_height.saturating_sub(status_height);
+
+    let mut output_height = 0;
+    if show_output {
+      let desired_output_height = if compact_viewport {
+        constants::COMPACT_OUTPUT_HEIGHT
+      } else {
+        constants::DEFAULT_OUTPUT_HEIGHT
+      };
+      let available_output_height = remaining_height.saturating_sub(1);
+      if available_output_height >= constants::MIN_OUTPUT_HEIGHT {
+        output_height = desired_output_height
+          .max(constants::MIN_OUTPUT_HEIGHT)
+          .min(available_output_height);
+        remaining_height = remaining_height.saturating_sub(output_height);
+      }
+    }
+
+    let mut constraints = Vec::with_capacity(4);
+    if header_height > 0 {
+      constraints.push(Constraint::Length(header_height));
+    }
+    constraints.push(Constraint::Length(remaining_height));
+    if output_height > 0 {
+      constraints.push(Constraint::Length(output_height));
+    }
+    constraints.push(Constraint::Length(status_height));
 
     let layout = Layout::default()
       .direction(Direction::Vertical)
-      .constraints([
-        Constraint::Length(3),
-        Constraint::Fill(2),
-        Constraint::Min(if f.area().height > 24 { 2 } else { 1 }),
-        Constraint::Min(status_height),
-      ])
-      .split(f.area());
+      .constraints(constraints)
+      .split(viewport);
 
-    let title = format!(" {} — {} hooks", self.source, self.hooks.len());
-    let header = Paragraph::new(Text::from(title))
-      .style(Style::default().add_modifier(Modifier::BOLD))
-      .block(
-        Block::default()
-          .borders(Borders::BOTTOM)
-          .border_type(BorderType::Rounded)
-          .title(" huk dashboard ")
-          .title(
-            Line::from(format!(" v{VERSION} "))
-              .right_aligned()
-              .style(Style::default().dim()),
-          ),
-      );
-    f.render_widget(header, layout[0]);
+    let mut layout_index = 0;
+    let header_area = if header_height > 0 {
+      let area = layout[layout_index];
+      layout_index += 1;
+      Some(area)
+    } else {
+      None
+    };
+    let main_area = layout[layout_index];
+    layout_index += 1;
+    let output_area = if output_height > 0 {
+      let area = layout[layout_index];
+      layout_index += 1;
+      Some(area)
+    } else {
+      None
+    };
+    let status_area = layout[layout_index];
+
+    if let Some(header_area) = header_area {
+      let title = format!(" {} — {} hooks", self.source, self.hooks.len());
+      let header = Paragraph::new(Text::from(title))
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .block(
+          Block::default()
+            .borders(Borders::BOTTOM)
+            .border_type(BorderType::Rounded)
+            .title(" huk dashboard ")
+            .title(
+              Line::from(format!(" v{VERSION} "))
+                .right_aligned()
+                .style(Style::default().dim()),
+            ),
+        );
+      f.render_widget(header, header_area);
+    }
 
     // Main area: list + details (responsive columns).
-    let main_area = layout[1];
-    let use_columns = main_area.width >= constants::MIN_TWO_COLUMN_WIDTH;
+    let use_columns = main_area.width >= constants::COLUMN_LAYOUT_THRESHOLD
+      || main_area.height < constants::MINIMUM_PANEL_HEIGHT.saturating_mul(2);
     let constraints = if use_columns {
       [Constraint::Percentage(50), Constraint::Percentage(50)]
     } else {
       [
-        Constraint::Min(constants::MIN_PANEL_HEIGHT),
-        Constraint::Min(constants::MIN_PANEL_HEIGHT),
+        Constraint::Min(constants::MINIMUM_PANEL_HEIGHT),
+        Constraint::Min(constants::MINIMUM_PANEL_HEIGHT),
       ]
     };
     let main = Layout::default()
@@ -774,8 +856,8 @@ impl Drawable for DashboardState<'_> {
           .iter()
           .enumerate()
           .map(|(i, (name, _))| {
-            let marker = if i == self.index { "›" } else { " " };
-            let style = if i == self.index {
+            let marker = if i == self.selected_hook { "›" } else { " " };
+            let style = if i == self.selected_hook {
               Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
@@ -798,7 +880,7 @@ impl Drawable for DashboardState<'_> {
         let selected = if self.hooks.is_empty() {
           None
         } else {
-          Some(self.index)
+          Some(self.selected_hook)
         };
         (
           items,
@@ -822,7 +904,7 @@ impl Drawable for DashboardState<'_> {
         } else {
           BorderType::Rounded
         })
-        .padding(Padding::uniform(1))
+        .padding(Padding::uniform(panel_padding))
         .title(hook_title),
     );
     if hook_selected.is_some() {
@@ -846,7 +928,7 @@ impl Drawable for DashboardState<'_> {
           } else {
             Style::default()
           })
-          .padding(Padding::uniform(1))
+          .padding(Padding::uniform(panel_padding))
           .title(hook_detail_title),
       )
       .wrap(ratatui::widgets::Wrap { trim: true });
@@ -868,14 +950,14 @@ impl Drawable for DashboardState<'_> {
       .iter()
       .enumerate()
       .map(|(i, (name, _))| {
-        let marker = if i == self.task { "›" } else { " " };
+        let marker = if i == self.selected_task { "›" } else { " " };
         let selected = task_picker_selection.contains(&i);
         let badge = if is_task_picker {
           if selected { "[x]" } else { "[ ]" }
         } else {
           ""
         };
-        let style = if i == self.task {
+        let style = if i == self.selected_task {
           Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -903,14 +985,14 @@ impl Drawable for DashboardState<'_> {
         } else {
           BorderType::Rounded
         })
-        .padding(Padding::uniform(1))
+        .padding(Padding::uniform(panel_padding))
         .title(format!(" {} ({}) ", self.task_label, self.task_source)),
     );
     let (tasks_list_area, tasks_detail_area) = split_list_detail(tasks_area);
     if self.tasks.is_empty() {
       self.task_state.select(None);
     } else {
-      self.task_state.select(Some(self.task));
+      self.task_state.select(Some(self.selected_task));
     }
     f.render_stateful_widget(task_list, tasks_list_area, &mut self.task_state);
 
@@ -933,7 +1015,7 @@ impl Drawable for DashboardState<'_> {
           } else {
             Style::default()
           })
-          .padding(Padding::uniform(1))
+          .padding(Padding::uniform(panel_padding))
           .title(format!(
             " {name} ",
             name = if let Some((name, _)) = self.current_task() {
@@ -947,35 +1029,56 @@ impl Drawable for DashboardState<'_> {
     f.render_widget(task_detail, tasks_detail_area);
 
     // Log panel.
-    let log_view_height = layout[2].height.saturating_sub(2).max(1) as usize;
-    let max_scroll = self.logs.len().saturating_sub(log_view_height);
-    let scroll = self.scroll.min(max_scroll);
-    let start = self
-      .logs
-      .len()
-      .saturating_sub(log_view_height.saturating_add(scroll));
-    let lines: Vec<Line> = self.logs[start..]
-      .iter()
-      .map(|entry| entry.to_line())
-      .collect();
-    let log = Paragraph::new(lines)
-      .block(
-        Block::default()
-          .borders(Borders::ALL)
-          .border_style(if self.focus == Focus::Output {
-            Style::default().fg(Color::Yellow)
-          } else {
-            Style::default()
-          })
-          .border_type(BorderType::Rounded)
-          .title(" Output "),
-      )
-      .wrap(ratatui::widgets::Wrap { trim: false });
+    if let Some(output_area) = output_area {
+      let log_view_height =
+        output_area.height.saturating_sub(2).max(1) as usize;
+      let lines = self.rendered_log_lines();
+      let max_scroll = lines.len().saturating_sub(log_view_height);
+      let scroll = self.scroll.min(max_scroll);
+      let end = lines.len().saturating_sub(scroll);
+      let start = end.saturating_sub(log_view_height);
+      let lines: Vec<Line> = lines
+        .into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
+      let log = Paragraph::new(lines)
+        .block(
+          Block::default()
+            .borders(Borders::ALL)
+            .border_style(if self.focus == Focus::Output {
+              Style::default().fg(Color::Yellow)
+            } else {
+              Style::default()
+            })
+            .border_type(BorderType::Rounded)
+            .title(" Output "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
-    f.render_widget(log, layout[2]);
+      f.render_widget(log, output_area);
+    }
 
     // Status / prompt line.
-    let (status_title, status_text) = if let Some(prompt) = &self.prompt {
+    let (status_title, status_text) = if compact_viewport {
+      if let Some(prompt) = &self.prompt {
+        let text = if prompt.needs_cursor() {
+          Text::from(prompt.buffer.clone())
+        } else {
+          Text::from(prompt.label.clone())
+        };
+        (None, text)
+      } else if self.running {
+        (None, Text::from("Running..."))
+      } else {
+        (
+          None,
+          Text::from(
+            "[enter] run · [a] add · [e] edit · [d] delete · [tab] focus · [q] quit",
+          ),
+        )
+      }
+    } else if let Some(prompt) = &self.prompt {
       let text = if prompt.needs_cursor() {
         Text::from(prompt.buffer.clone())
       } else {
@@ -992,25 +1095,43 @@ impl Drawable for DashboardState<'_> {
         ),
       )
     };
-    let mut status_block = Block::default()
-      .borders(Borders::ALL)
-      .border_type(BorderType::Rounded);
-    if let Some(title) = status_title {
-      status_block = status_block.title(title);
+    if compact_viewport {
+      let status = Paragraph::new(status_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+      f.render_widget(status, status_area);
+    } else {
+      let mut status_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+      if let Some(title) = status_title {
+        status_block = status_block.title(title);
+      }
+      let status = Paragraph::new(status_text)
+        .block(status_block)
+        .wrap(ratatui::widgets::Wrap { trim: false });
+      f.render_widget(status, status_area);
     }
-    let status = Paragraph::new(status_text)
-      .block(status_block)
-      .wrap(ratatui::widgets::Wrap { trim: false });
-    f.render_widget(status, layout[3]);
 
     if let Some(prompt) = self.prompt.as_ref()
       && prompt.needs_cursor()
+      && status_area.height > 0
+      && status_area.width > 0
     {
-      let inner_width = layout[3].width.saturating_sub(2).max(1);
-      let inner_height = layout[3].height.saturating_sub(2).max(1);
+      let (inner_width, inner_height, x_offset, y_offset) = if compact_viewport
+      {
+        (status_area.width.max(1), 1, 0, 0)
+      } else {
+        (
+          status_area.width.saturating_sub(2).max(1),
+          status_area.height.saturating_sub(2).max(1),
+          1,
+          1,
+        )
+      };
       let (cx, cy) = prompt.visual_cursor(inner_width);
-      let x = layout[3].x + 1 + cx.min(inner_width.saturating_sub(1));
-      let y = layout[3].y + 1 + cy.min(inner_height.saturating_sub(1));
+      let x = status_area.x + x_offset + cx.min(inner_width.saturating_sub(1));
+      let y = status_area.y + y_offset + cy.min(inner_height.saturating_sub(1));
       f.set_cursor_position((x, y));
     }
   }
@@ -1133,7 +1254,7 @@ impl<'a> InputHandler for DashboardState<'a> {
             if self.tasks.is_empty() {
               self.set_prompt(Prompt::add_hook_spec(name))?;
             } else {
-              self.task = 0;
+              self.selected_task = 0;
               self.set_prompt(Prompt::pick_task(
                 name,
                 SpecEditMode::Add,
@@ -1227,7 +1348,7 @@ impl<'a> InputHandler for DashboardState<'a> {
       } => match code {
         Up => {
           index = index.saturating_sub(1);
-          self.task = index;
+          self.selected_task = index;
           self.set_prompt(Prompt {
             kind: PromptKind::PickTask {
               hook,
@@ -1244,7 +1365,7 @@ impl<'a> InputHandler for DashboardState<'a> {
           if index + 1 < self.tasks.len() {
             index += 1;
           }
-          self.task = index;
+          self.selected_task = index;
           self.set_prompt(Prompt {
             kind: PromptKind::PickTask {
               hook,
@@ -1358,6 +1479,31 @@ impl<'a> MouseHandler for DashboardState<'a> {
 }
 
 impl<'a> DashboardState<'a> {
+  fn output_panel_visible(&self) -> bool {
+    self.logs.iter().any(LogEntry::has_rendered_lines)
+  }
+
+  fn compact_viewport(viewport: Rect) -> bool {
+    viewport.height <= constants::COMPACT_VIEWPORT_HEIGHT
+      || viewport.width < constants::COLUMN_LAYOUT_THRESHOLD
+  }
+
+  fn cycle_focus(&mut self, forward: bool) {
+    let output_visible = self.output_panel_visible();
+    let mut next_focus = self.focus;
+    loop {
+      next_focus = if forward {
+        next_focus.next()
+      } else {
+        next_focus.prev()
+      };
+      if output_visible || next_focus != Focus::Output {
+        self.focus = next_focus;
+        break;
+      }
+    }
+  }
+
   pub fn from_cwd(cwd: &'a Path) -> Self {
     Self {
       cwd,
@@ -1382,9 +1528,9 @@ impl<'a> DashboardState<'a> {
     Self {
       cwd,
       hooks,
-      index: 0,
+      selected_hook: 0,
       tasks,
-      task: 0,
+      selected_task: 0,
       hook_state: ListState::default(),
       task_state: ListState::default(),
       running: false,
@@ -1408,16 +1554,16 @@ impl<'a> DashboardState<'a> {
       .collect();
     hooks.sort_by(|a, b| a.0.cmp(&b.0));
     self.hooks = hooks;
-    if self.index >= self.hooks.len() && !self.hooks.is_empty() {
-      self.index = self.hooks.len() - 1;
+    if self.selected_hook >= self.hooks.len() && !self.hooks.is_empty() {
+      self.selected_hook = self.hooks.len() - 1;
     }
     self.tasks = cfg
       .tasks()
       .into_iter()
       .map(|(name, spec)| (name.to_string(), spec))
       .collect();
-    if self.task >= self.tasks.len() && !self.tasks.is_empty() {
-      self.task = self.tasks.len() - 1;
+    if self.selected_task >= self.tasks.len() && !self.tasks.is_empty() {
+      self.selected_task = self.tasks.len() - 1;
     }
     self.source = cfg.source.as_str().to_string();
     self.task_label = task_source_label(cfg);
@@ -1425,11 +1571,17 @@ impl<'a> DashboardState<'a> {
   }
 
   pub fn current_hook(&self) -> Option<(&String, &TaskSpec)> {
-    self.hooks.get(self.index).map(|(name, spec)| (name, spec))
+    self
+      .hooks
+      .get(self.selected_hook)
+      .map(|(name, spec)| (name, spec))
   }
 
   pub fn current_task(&self) -> Option<(&String, &TaskSpec)> {
-    self.tasks.get(self.task).map(|(name, spec)| (name, spec))
+    self
+      .tasks
+      .get(self.selected_task)
+      .map(|(name, spec)| (name, spec))
   }
 
   pub fn run_task(&mut self, task: &str) -> Result<(), RunnerError> {
@@ -1454,27 +1606,39 @@ impl<'a> DashboardState<'a> {
   }
 
   pub fn move_selection_up(&mut self) {
-    self.index = self.index.saturating_sub(1);
+    self.selected_hook = self.selected_hook.saturating_sub(1);
   }
 
   pub fn move_selection_down(&mut self) {
-    if self.index + 1 < self.hooks.len() {
-      self.index += 1;
+    if self.selected_hook + 1 < self.hooks.len() {
+      self.selected_hook += 1;
     }
   }
 
   pub fn push_log(&mut self, level: LogLevel, message: impl Into<String>) {
-    self.logs.push(LogEntry {
+    let entry = LogEntry {
       level,
       message: message.into(),
       timestamp: chrono::Local::now(),
-    });
+    };
+    let added_lines = entry.line_count();
+    if added_lines == 0 {
+      return;
+    }
+    self.logs.push(entry);
     if self.scroll > 0 {
-      self.scroll += 1;
+      self.scroll += added_lines;
     }
     if self.logs.len() > constants::LOG_LIMIT {
       let excess = self.logs.len() - constants::LOG_LIMIT;
+      let removed_lines: usize = self
+        .logs
+        .iter()
+        .take(excess)
+        .map(LogEntry::line_count)
+        .sum();
       self.logs.drain(0..excess);
+      self.scroll = self.scroll.saturating_sub(removed_lines);
       self.normalize_scroll();
     }
   }
@@ -1498,7 +1662,7 @@ impl<'a> DashboardState<'a> {
     if let Some((idx, _)) =
       self.hooks.iter().enumerate().find(|(_, (n, _))| n == name)
     {
-      self.index = idx;
+      self.selected_hook = idx;
     }
   }
 
@@ -1524,9 +1688,9 @@ impl<'a> DashboardState<'a> {
 
     if matches!(self.focus, Hooks | Tasks) {
       let (list, offset) = if self.focus == Hooks {
-        (&mut self.hook_state, &mut self.index)
+        (&mut self.hook_state, &mut self.selected_hook)
       } else {
-        (&mut self.task_state, &mut self.task)
+        (&mut self.task_state, &mut self.selected_task)
       };
 
       if delta < 0 {
@@ -1558,11 +1722,11 @@ impl<'a> DashboardState<'a> {
   }
 
   pub fn scroll_logs(&mut self, delta: isize) {
-    if self.logs.is_empty() {
+    let max = self.rendered_log_line_count().saturating_sub(1);
+    if max == 0 {
       self.scroll_to_log_end();
       return;
     }
-    let max = self.logs.len().saturating_sub(1);
     if delta.is_negative() {
       let amount = delta.wrapping_abs() as usize;
       self.scroll = self.scroll.saturating_sub(amount);
@@ -1573,10 +1737,11 @@ impl<'a> DashboardState<'a> {
   }
 
   pub fn scroll_to_log_start(&mut self) {
-    if self.logs.is_empty() {
+    let max = self.rendered_log_line_count().saturating_sub(1);
+    if max == 0 {
       self.scroll_to_log_end();
     } else {
-      self.scroll = self.logs.len().saturating_sub(1);
+      self.scroll = max;
     }
   }
 
@@ -1585,11 +1750,11 @@ impl<'a> DashboardState<'a> {
   }
 
   pub fn normalize_scroll(&mut self) {
-    if self.logs.is_empty() {
+    let max = self.rendered_log_line_count().saturating_sub(1);
+    if max == 0 {
       self.scroll_to_log_end();
       return;
     }
-    let max = self.logs.len().saturating_sub(1);
     if self.scroll > max {
       self.scroll = max;
     }
@@ -1598,11 +1763,25 @@ impl<'a> DashboardState<'a> {
   pub fn status_height(&self, width: u16) -> u16 {
     if let Some(prompt) = &self.prompt {
       let inner_width = width.saturating_sub(2).max(1);
-      let height = prompt.visual_height(inner_width);
-      height.max(3).min(10)
+      prompt
+        .visual_height(inner_width)
+        .clamp(
+          constants::MINIMUM_PROMPT_HEIGHT,
+          constants::MAXIMUM_PROMPT_HEIGHT,
+        )
+        .saturating_add(2)
+        .max(constants::DEFAULT_STATUS_HEIGHT)
     } else {
-      3
+      constants::DEFAULT_STATUS_HEIGHT
     }
+  }
+
+  fn rendered_log_line_count(&self) -> usize {
+    self.logs.iter().map(LogEntry::line_count).sum()
+  }
+
+  fn rendered_log_lines(&self) -> Vec<Line<'_>> {
+    self.logs.iter().flat_map(LogEntry::to_lines).collect()
   }
 }
 
@@ -1695,11 +1874,10 @@ impl Prompt {
 
   pub fn update_hook(hook: String, preset: String) -> Self {
     Self {
-      kind: PromptKind::Update { hook: hook.clone() },
-      label: format!("Manual spec for '{hook}'"),
-      buffer: preset.clone(),
+      kind:         PromptKind::Update { hook: hook.clone() },
+      label:        format!("Manual spec for '{hook}'"),
+      buffer:       preset.clone(),
       cursor_index: preset.len(),
-      ..Default::default()
     }
   }
 
@@ -1809,9 +1987,10 @@ impl Prompt {
 
   fn index_for_column(&self, line_start: usize, target_col: usize) -> usize {
     let line_start = line_start.min(self.buffer.len());
-    let mut col = 0;
     let mut idx = line_start;
-    for (offset, ch) in self.buffer[line_start..].char_indices() {
+    for (col, (offset, ch)) in
+      self.buffer[line_start..].char_indices().enumerate()
+    {
       if ch == '\n' {
         break;
       }
@@ -1819,7 +1998,6 @@ impl Prompt {
         idx = line_start + offset;
         return idx;
       }
-      col += 1;
       idx = line_start + offset + ch.len_utf8();
     }
     idx
@@ -1971,6 +2149,40 @@ impl PromptCursor for Prompt {
   }
 }
 
+#[derive(Clone, Copy, IsVariant, PartialEq, Eq, Display, Debug)]
+pub enum LogLevel {
+  #[display("info")]
+  Info,
+  #[display("success")]
+  Success,
+  #[display("stdout")]
+  Stdout,
+  #[display("stderr")]
+  Stderr,
+  #[display("error")]
+  Error,
+}
+
+impl LogLevel {
+  const fn color(&self) -> Color {
+    match self {
+      LogLevel::Info => Color::Cyan,
+      LogLevel::Success => Color::Green,
+      LogLevel::Stdout => Color::Gray,
+      LogLevel::Stderr => Color::Red,
+      LogLevel::Error => Color::LightRed,
+    }
+  }
+
+  fn label(&self) -> Span<'_> {
+    let span = Span::raw(self.to_string());
+    if constants::LOG_COLOR {
+      return span.style(self.color());
+    }
+    span
+  }
+}
+
 #[derive(Clone)]
 pub struct LogEntry {
   level:     LogLevel,
@@ -1979,36 +2191,148 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-  fn to_line(&self) -> Line<'_> {
-    let (label, color) = match self.level {
-      LogLevel::Info => ("info", Color::Cyan),
-      LogLevel::Success => ("ok", Color::Green),
-      LogLevel::Stdout => ("out", Color::Gray),
-      LogLevel::Stderr => ("err", Color::Red),
-      LogLevel::Error => ("fail", Color::LightRed),
-    };
-    let time = self.timestamp.format("%H:%M:%S").to_string();
-    let prefix = format!("{label} [{time}] ");
-    let mut indent = String::from('\n');
-    for _ in 0..prefix.len() {
-      indent.push(' ');
+  fn normalized_message(&self) -> String {
+    self
+      .message
+      .replace("\r\n", "\n")
+      .replace('\r', "\n")
+      .trim_end_matches('\n')
+      .to_string()
+  }
+
+  fn line_count(&self) -> usize {
+    let normalized = self.normalized_message();
+    if normalized.is_empty() {
+      0
+    } else {
+      normalized.split('\n').count()
     }
-    Line::from(vec![
-      Span::styled(
-        format!("{label} "),
+  }
+
+  fn has_rendered_lines(&self) -> bool {
+    self.line_count() > 0
+  }
+
+  fn to_lines(&self) -> Vec<Line<'_>> {
+    let (label, color) = (self.level.to_string(), self.level.color());
+    let normalized = self.normalized_message();
+    if normalized.is_empty() {
+      return Vec::new();
+    }
+
+    let label_prefix = format!("{label} ");
+    let mut prefix_width = label_prefix.len();
+    let mut first_line_prefix = Vec::new();
+    if constants::LOG_COLOR {
+      first_line_prefix.push(Span::styled(
+        label_prefix.clone(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
-      ),
-      Span::styled(format!("[{time}] "), Style::default().fg(Color::DarkGray)),
-      Span::raw(self.message.replace(['\r', '\n'], &indent)),
-    ])
+      ));
+    } else {
+      first_line_prefix.push(Span::raw(label_prefix.clone()));
+    }
+
+    if constants::LOG_TIMES {
+      let time = self.timestamp.format(constants::LOG_TIME_FMT).to_string();
+      let time_prefix = format!("[{time}] ");
+      prefix_width += time_prefix.len();
+      first_line_prefix.push(Span::styled(
+        time_prefix,
+        Style::default().fg(Color::DarkGray),
+      ));
+    }
+
+    let continuation_prefix = " ".repeat(prefix_width);
+    let mut lines = Vec::new();
+
+    for (index, line) in normalized.split('\n').enumerate() {
+      if index == 0 {
+        let mut spans = first_line_prefix.clone();
+        spans.push(Span::raw(line.to_string()));
+        lines.push(Line::from(spans));
+      } else {
+        lines.push(Line::from(vec![
+          Span::raw(continuation_prefix.clone()),
+          Span::raw(line.to_string()),
+        ]));
+      }
+    }
+
+    lines
   }
 }
 
-#[derive(Clone, Copy)]
-pub enum LogLevel {
-  Info,
-  Success,
-  Stdout,
-  Stderr,
-  Error,
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn line_text(line: &Line<'_>) -> String {
+    line
+      .spans
+      .iter()
+      .map(|span| span.content.as_ref())
+      .collect::<String>()
+  }
+
+  #[test]
+  fn log_entry_to_lines_preserves_multiline_prefix_alignment() {
+    let entry = LogEntry {
+      level:     LogLevel::Stdout,
+      message:   "first line\nsecond line\nthird line\n".to_string(),
+      timestamp: chrono::Local::now(),
+    };
+
+    let lines = entry.to_lines();
+
+    assert_eq!(lines.len(), 3);
+
+    let first = line_text(&lines[0]);
+    let second = line_text(&lines[1]);
+    let third = line_text(&lines[2]);
+    let prefix = first.strip_suffix("first line").unwrap();
+    let continuation_prefix = " ".repeat(prefix.len());
+
+    assert_eq!(second, format!("{continuation_prefix}second line"));
+    assert_eq!(third, format!("{continuation_prefix}third line"));
+  }
+
+  #[test]
+  fn empty_output_entries_do_not_render_any_lines() {
+    let entry = LogEntry {
+      level:     LogLevel::Stdout,
+      message:   "\n\n".to_string(),
+      timestamp: chrono::Local::now(),
+    };
+
+    assert!(entry.to_lines().is_empty());
+    assert_eq!(entry.line_count(), 0);
+  }
+
+  #[test]
+  fn output_panel_visibility_ignores_empty_output() {
+    let mut state = DashboardState::default();
+    state.append_output(vec![OutputChunk::Stdout("\n".to_string().into())]);
+    assert!(!state.output_panel_visible());
+
+    state.push_log(LogLevel::Info, "hook finished");
+    assert!(state.output_panel_visible());
+  }
+
+  #[test]
+  fn multiline_logs_scroll_by_rendered_lines() {
+    let mut state = DashboardState::default();
+    state.push_log(LogLevel::Stdout, "one\ntwo\nthree");
+
+    state.scroll_to_log_start();
+    assert_eq!(state.scroll, 2);
+
+    state.scroll_logs(-1);
+    assert_eq!(state.scroll, 1);
+
+    state.push_log(LogLevel::Stderr, "four\nfive");
+    assert_eq!(state.scroll, 3);
+
+    state.normalize_scroll();
+    assert_eq!(state.scroll, 3);
+  }
 }
