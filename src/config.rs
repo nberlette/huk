@@ -1,25 +1,28 @@
 //! Configuration discovery and parsing.
 //!
 //! This module contains logic for locating and parsing configuration files
-//! that define hooks and tasks. The utility searches for a `deno.json` or
-//! `deno.jsonc` file first; if none is found it will fall back to a
-//! `package.json` file. The chosen file is inspected for a top-level
+//! that define hooks and tasks. The utility prefers a `deno.json` or
+//! `deno.jsonc` file, but will fall back to `package.json` when no hooks are
+//! present in the Deno config. The chosen file is inspected for a top-level
 //! `hooks` object mapping Git hook names to task specifications. In
 //! addition, the Node `scripts` field and Deno `tasks` field are captured
 //! so that tasks can reference them.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+use derive_more::IsVariant;
+use moos::CowStr;
+use serde_json::Value;
+use serde_json::{self};
+use thiserror::Error;
 
 use crate::constants::GIT_HOOKS;
 use crate::handlers::RunnerError;
 use crate::task::TaskSpec;
 use crate::task::TaskSpecParseError;
-use derive_more::IsVariant;
-use serde_json::Value;
-use serde_json::{self};
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
-use thiserror::Error;
 
 /// A resolved configuration containing hook definitions and tasks.
 #[derive(Debug, Clone)]
@@ -30,14 +33,35 @@ pub struct HookConfig {
   pub source:          ConfigSource,
   /// Mapping of hook names (e.g. "pre-commit") to their task specification.
   pub hooks:           HashMap<String, TaskSpec>,
-  /// Mapping of task names to raw commands coming from the Node `scripts`
+  /// Mapping of task names to script commands coming from the Node `scripts`
   /// field.
-  pub node_scripts:    HashMap<String, String>,
-  /// Mapping of task names to raw commands coming from the Deno `tasks` field.
-  pub deno_tasks:      HashMap<String, String>,
+  pub node_scripts:    HashMap<String, CowStr<'static>>,
+  /// Mapping of task names to Deno task specifications from the `tasks` field.
+  pub deno_tasks:      HashMap<String, TaskSpec>,
   /// The preferred package manager to use when executing Node scripts (npm,
   /// pnpm, yarn, etc.).
   pub package_manager: Option<String>,
+}
+
+impl<'a> HookConfig
+where
+  Self: 'a,
+{
+  pub(crate) fn tasks(&'a self) -> Vec<(CowStr<'a>, TaskSpec)> {
+    let mut specs: Vec<(CowStr<'a>, TaskSpec)> = vec![];
+
+    for (s, t) in &self.deno_tasks {
+      specs.push((s.as_str().into(), t.clone()));
+    }
+
+    for (s, t) in &self.node_scripts {
+      let spec = TaskSpec::Single(t.clone());
+      specs.push((s.as_str().into(), spec))
+    }
+
+    specs.sort_by_key(|(k, _)| (*k).to_ascii_lowercase());
+    specs
+  }
 }
 
 /// Enum describing where the configuration was loaded from.
@@ -124,6 +148,9 @@ pub enum ConfigError {
   /// The hooks field exists but could not be parsed into a task specification.
   #[error("invalid hook definition for '{0}': {1}")]
   InvalidHook(String, #[source] TaskSpecParseError),
+  /// A Deno task definition could not be parsed or validated.
+  #[error("invalid task definition for '{0}': {1}")]
+  InvalidTask(String, String),
   /// An unknown or unsupported Git hook name was specified.
   #[error("unknown Git hook name '{0}'. Supported hooks are: {supported_hooks}", supported_hooks = GIT_HOOKS.join(", "))]
   UnknownHook(String),
@@ -131,18 +158,36 @@ pub enum ConfigError {
 
 impl HookConfig {
   /// Discover and load a configuration from the specified directory. The search
-  /// order is `deno.json`, `deno.jsonc`, then `package.json`. If none of
-  /// these exist, returns [`ConfigError::NotFound`].
+  /// order is `deno.json`, `deno.jsonc`, then `package.json`, but if a Deno
+  /// config exists without hooks and a package.json with hooks is present, the
+  /// package.json is preferred. If none of these exist, returns
+  /// [`ConfigError::NotFound`].
   pub fn discover(dir: &Path) -> Result<Self, ConfigError> {
     let deno_json = dir.join("deno.json");
     let deno_jsonc = dir.join("deno.jsonc");
     let package_json = dir.join("package.json");
 
-    if deno_json.exists() {
-      Self::load_deno_json(&deno_json)
+    let deno_path = if deno_json.exists() {
+      Some(deno_json)
     } else if deno_jsonc.exists() {
-      Self::load_deno_json(&deno_jsonc)
-    } else if package_json.exists() {
+      Some(deno_jsonc)
+    } else {
+      None
+    };
+
+    if let Some(deno_path) = deno_path {
+      let deno_has_hooks = Self::config_has_hooks(&deno_path, true)?;
+      if deno_has_hooks {
+        return Self::load_deno_json(&deno_path);
+      }
+      if package_json.exists() && Self::config_has_hooks(&package_json, false)?
+      {
+        return Self::load_package_json(&package_json);
+      }
+      return Self::load_deno_json(&deno_path);
+    }
+
+    if package_json.exists() {
       Self::load_package_json(&package_json)
     } else {
       Err(ConfigError::NotFound(dir.to_path_buf()))
@@ -175,35 +220,15 @@ impl HookConfig {
         }
       }
     }
-    // Extract deno tasks (these are simple command strings in Deno).
+    // Extract deno tasks (strings or structured TaskSpec objects).
     let mut deno_tasks = HashMap::new();
     if let Some(Value::Object(tasks)) = value.get("tasks") {
       for (name, val) in tasks {
-        match val {
-          Value::String(cmd) => {
-            deno_tasks.insert(name.clone(), cmd.clone());
-          }
-          // Deno tasks may also be objects with command/description etc.
-          Value::Object(obj) => {
-            let mut cmd_parts = Vec::new();
-            if let Some(Value::Array(deps)) = obj.get("dependencies") {
-              // If only dependencies are defined, we can join them with "&&".
-              for dep in deps {
-                if let Value::String(task) = dep {
-                  cmd_parts.push(format!("deno task {task}"));
-                }
-              }
-            }
-            if let Some(Value::String(cmd)) = obj.get("command") {
-              cmd_parts.push(cmd.clone());
-            }
-            let joined = cmd_parts.join(" && ");
-            deno_tasks.insert(name.clone(), joined);
-          }
-          _ => {}
-        }
+        let spec = Self::parse_deno_task(name, val)?;
+        deno_tasks.insert(name.clone(), spec);
       }
     }
+    Self::validate_deno_task_dependencies(&deno_tasks)?;
     Ok(HookConfig {
       source: ConfigSource::DenoJson(path.to_path_buf()),
       hooks,
@@ -242,7 +267,7 @@ impl HookConfig {
     if let Some(Value::Object(scripts)) = value.get("scripts") {
       for (name, val) in scripts {
         if let Value::String(cmd) = val {
-          node_scripts.insert(name.clone(), cmd.clone());
+          node_scripts.insert(name.clone(), CowStr::from(cmd.clone()));
         }
       }
     }
@@ -260,6 +285,56 @@ impl HookConfig {
       deno_tasks: HashMap::new(),
       package_manager,
     })
+  }
+
+  fn config_has_hooks(path: &Path, is_deno: bool) -> Result<bool, ConfigError> {
+    let content = fs::read_to_string(path)
+      .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    let content = if is_deno {
+      strip_json_comments(&content)
+    } else {
+      content
+    };
+    let value: Value = serde_json::from_str(&content)
+      .map_err(|e| ConfigError::Json(path.to_path_buf(), e))?;
+    Ok(matches!(value.get("hooks"), Some(Value::Object(_))))
+  }
+
+  fn parse_deno_task(
+    name: &str,
+    value: &Value,
+  ) -> Result<TaskSpec, ConfigError> {
+    if let Value::Object(map) = value
+      && let Some(deps_value) =
+        map.get("dependencies").or_else(|| map.get("depends"))
+      && !matches!(deps_value, Value::Array(_))
+    {
+      return Err(ConfigError::InvalidTask(
+        name.to_string(),
+        "dependencies must be an array of strings".into(),
+      ));
+    }
+    TaskSpec::from_json(value).map_err(|err| {
+      ConfigError::InvalidTask(name.to_string(), err.to_string())
+    })
+  }
+
+  fn validate_deno_task_dependencies(
+    tasks: &HashMap<String, TaskSpec>,
+  ) -> Result<(), ConfigError> {
+    for (name, spec) in tasks {
+      if let TaskSpec::Detailed { dependencies, .. } = spec {
+        for dep in dependencies {
+          if !tasks.contains_key(dep.as_ref()) {
+            return Err(ConfigError::InvalidTask(
+              name.clone(),
+              format!("dependency '{dep}' is not defined in tasks"),
+            ));
+          }
+        }
+      }
+    }
+    Ok(())
   }
 }
 
@@ -336,7 +411,7 @@ pub(crate) fn parse_spec_input(spec: &str) -> Result<TaskSpec, RunnerError> {
     let value: Value = serde_json::from_str(trimmed)?;
     TaskSpec::from_json(&value).map_err(RunnerError::InvalidTaskSpec)
   } else {
-    Ok(TaskSpec::Single(trimmed.to_string()))
+    Ok(TaskSpec::Single(CowStr::from(trimmed.to_string())))
   }
 }
 

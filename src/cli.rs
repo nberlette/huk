@@ -4,11 +4,14 @@
 //! the `huk` executable exposes. It uses the [`clap`](https://crates.io/crates/clap)
 //! crate for ergonomic argument parsing.
 
+use std::path::PathBuf;
+
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use derive_more::with_trait::IsVariant;
 use derive_more::with_trait::TryInto;
+use lazy_static::lazy_static;
 use paste::paste;
 use thiserror::Error;
 
@@ -44,6 +47,10 @@ pub struct Cli {
   /// Subcommand to execute.
   #[command(subcommand)]
   pub command: Commands,
+}
+
+lazy_static! {
+  static ref LAZY_CWD: PathBuf = std::env::current_dir().unwrap_or_default();
 }
 
 macro_rules! cli {
@@ -113,6 +120,21 @@ macro_rules! cli {
   };
 }
 
+const TASK_SPEC_LONG_HELP: &str = "\
+  Task specification to associate with the hook.\n\n\
+  Accepted task specification forms:\n \
+  1. a raw shell command string (e.g. `\"git add -A\"`)\n \
+  2. a task name from the configuration file, which must either be:\n   \
+  - defined in the `tasks` section of a deno.json file, or ...\n   \
+  - defined in the `scripts` section of a package.json file\n \
+  3. an object with `command`, `dependencies`, and/or `description` fields, where:\n   \
+  - `command` is a shell command string to execute,\n   \
+  - `dependencies` is an array of tasks to run before the command,\n     \
+  Note: this field is required if `command` is not provided.\n   \
+  - `description` is a human-readable summary of the task (optional)\n \
+  4. a sequence where value satisfies either type 1, 2, or 3 a `bove.\n \
+  Multiple specifications can be provided to build a sequence.";
+
 cli! {
   /// Launch an interactive dashboard for managing hooks and tasks.
   #[command(
@@ -140,7 +162,12 @@ cli! {
        ←|→ (left / right)\n    \
            Reposition the cursor in text fields.\n")]
   #[cfg(feature = "tui")]
-  Dashboard(Default),
+  Dashboard(Default) {
+    /// Set the working directory to run the huk dashboard in.
+    ///
+    /// Defaults to the current working directory.
+    cwd(long, short = 'C', default_value = LAZY_CWD.to_str()): Option<PathBuf>,
+  },
   /// List configured Git hooks and associated tasks.
   #[command(
     aliases = ["ls", "l", "hooks"],
@@ -157,21 +184,21 @@ cli! {
     ): bool,
     /// Only output hook names without associated tasks.
     name_only(long, short = 'n'): bool,
-    /// Format the results as standard JSON (JavaScript Object Notation).
+    /// Format results as JSON (JavaScript Object Notation).
     json(long, short = 'j'): bool,
-    /// Format the results as YAML (YAML Ain't Markup Language).
-    yaml(long, short = 'y', long_help = "Format the results as YAML (YAML \
+    /// Format results as YAML (YAML Ain't Markup Language).
+    yaml(long, short = 'y', long_help = "Format results as YAML (YAML \
     Ain't Markup Language).\n\nNote: this currently ignores the --compact flag."): bool,
-    /// Format the results as TOML (Tom's Obvious, Minimal Language).
+    /// Format results as TOML (Tom's Obvious, Minimal Language).
     toml(long, short = 't'): bool,
-    /// Outputs a static list of names of all Git hooks that `huk` supports.
+    /// Output a static list of names of all Git hooks that `huk` supports.
     all(
       long,
       short = 'a',
-      long_help = "Output a list of names of all the Git hooks supported by \
-        `huk`.\n\nUnlike other list options, this is unrelated to configuration.\n\
-        It returns an immutable list of Git hook names (like 'pre-commit'),\n\
-        indicating all of the hooks supported and understood by `huk`."
+      long_help = "Outputs the names of all Git hooks supported by `huk`.\n\n\
+        Unlike other list options, this is unrelated to configuration,\n\
+        and returns an immutable list of hook names (like 'pre-commit',\n\
+        'post-checkout', etc.) supported as keys in the 'hooks' object."
     ): bool,
   },
   /// Run the tasks for the specified hook name.
@@ -186,11 +213,10 @@ cli! {
     hook(): String,
     /// Additional arguments to forward to the hook runner.
     args(
-      last = true,
       long_help = "Additional arguments to forward to the hook runner.\n\n\
-        Depending on the hook being executed, Git may provide additional \
-        arguments, such as the commit message file for `commit-msg` hook. \
-        These will be passed along in order."
+        Depending on the hook being executed, Git might provide\n\
+        additional arguments at runtime (e.g., a commit message\n\
+        file to `commit-msg`). These are passed as-is, in order."
     ): Vec<String>,
     /// Enable verbose output during task execution.
     verbose(long, short = 'v'): bool,
@@ -233,19 +259,7 @@ cli! {
     spec(
       required = true,
       last = true,
-      long_help = "Task specification to associate with the hook.\n\n\
-        Task specifications can take on several different forms:\n \
-        1. a raw shell command string (e.g. `\"git add -A\"`)\n \
-        2. a task name from the configuration file, which must either be:\n   \
-        - defined in the `tasks` section of a deno.json file, or ...\n   \
-        - defined in the `scripts` section of a package.json file\n \
-        3. an object with `command`, `dependencies`, and/or `description` fields, where:\n   \
-        - `command` is a shell command string to execute,\n   \
-        - `dependencies` is an array of tasks to run before the command,\n     \
-        Note: this field is required if `command` is not provided.\n   \
-        - `description` is a human-readable summary of the task (optional)\n \
-        4. a sequence where value satisfies either type 1, 2, or 3 above.\n \
-        Multiple specifications can be provided to build a sequence."
+      long_help = TASK_SPEC_LONG_HELP
     ): Vec<String>,
     /// Replace any existing hook definition instead of appending to it.
     replace(long, short = 'r'): bool,
@@ -275,19 +289,7 @@ cli! {
     spec(
       required = true,
       last = true,
-      long_help = "New task specification to associate with the hook.\n\n\
-        Task specifications can take on several different forms:\n \
-        1. a raw shell command string (e.g. `\"git add -A\"`)\n \
-        2. a task name from the configuration file, which must either be:\n   \
-        - defined in the `tasks` section of a deno.json file, or ...\n   \
-        - defined in the `scripts` section of a package.json file\n \
-        3. an object with `command`, `dependencies`, and/or `description` fields, where:\n   \
-        - `command` is a shell command string to execute,\n   \
-        - `dependencies` is an array of tasks to run before the command,\n     \
-        Note: this field is required if `command` is not provided.\n   \
-        - `description` is a human-readable summary of the task (optional)\n \
-        4. a sequence where value satisfies either type 1, 2, or 3 above.\n \
-        Multiple specifications can be provided to build a sequence."
+      long_help = TASK_SPEC_LONG_HELP
     ): Vec<String>,
     /// Replace the existing hook definition instead of appending to it.
     replace(long, short = 'r'): bool,

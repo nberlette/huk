@@ -709,9 +709,9 @@ dependencies = [
 
 [[package]]
 name = "moos"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "352be24acc3195d5ca0673318d0ae8320f9e51b4d3093eb1deffc72d5300c3d9"
+checksum = "a418c89f2b6961d06174252b76d8992d95b98c891ca66d1f7cff2f0f30851b6e"
 dependencies = [
  "derive_more",
  "serde",
